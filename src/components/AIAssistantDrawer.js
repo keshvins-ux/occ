@@ -17,7 +17,7 @@ export default function AIAssistantDrawer({ open, onClose }) {
     {
       role: "assistant",
       content:
-        "Hi! I'm your OCC AI assistant, powered by Claude. Ask me anything about your business — customers, orders, stock, AR, or trends.",
+        "Hi! I'm your OCC AI assistant, powered by Seri Rasa. Ask me anything about your business — customers, orders, stock, AR, or trends.",
     },
   ]);
   const [input, setInput] = useState("");
@@ -155,7 +155,7 @@ export default function AIAssistantDrawer({ open, onClose }) {
                   boxShadow: `0 0 8px ${COLORS.success}`,
                 }}
               />
-              Powered by Claude · Read-only
+              Powered by Seri Rasa · Read-only
             </div>
           </div>
           <button
