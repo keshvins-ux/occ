@@ -143,7 +143,7 @@ export default function ManagementSOLifecycle() {
           iconColor={COLORS.neutral}
           label="Total SOs"
           value={loading ? "" : fmt0(stats.total)}
-          trend={`Last ${range.label}`}
+          trend={`${range.label}`}
           trendDirection="neutral"
           loading={loading}
         />

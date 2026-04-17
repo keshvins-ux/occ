@@ -73,7 +73,7 @@ export default function SalesAnalytics() {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-        <Card title="Agent Performance" subtitle={`Revenue by sales agent · Last ${range.label}`}>
+        <Card title="Agent Performance" subtitle={`Revenue by sales agent · ${range.label}`}>
           {loading ? (
             <Loading />
           ) : (
@@ -114,7 +114,7 @@ export default function SalesAnalytics() {
           )}
         </Card>
 
-        <Card title="Top Products" subtitle={`By revenue · Last ${range.label}`}>
+        <Card title="Top Products" subtitle={`By revenue · ${range.label}`}>
           {loading ? (
             <Loading />
           ) : (

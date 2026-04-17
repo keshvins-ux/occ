@@ -96,7 +96,7 @@ export default function SalesOverview() {
       <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 20, marginBottom: 20 }}>
         <Card
           title="Revenue Trend"
-          subtitle={`Monthly totals for the last ${range.label}`}
+          subtitle={`Monthly totals · ${range.label}`}
           action={
             <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
               <Legend color="linear-gradient(180deg, #60A5FA, #2563EB)" label="Invoiced" />
@@ -108,7 +108,7 @@ export default function SalesOverview() {
         </Card>
         <Card
           title="Top Customers"
-          subtitle={`By revenue · Last ${range.label}`}
+          subtitle={`By revenue · ${range.label}`}
           action={
             <span style={{ fontSize: 12, color: BRAND.accent, cursor: "pointer", fontWeight: 600 }}>
               View all →
@@ -121,7 +121,7 @@ export default function SalesOverview() {
 
       <Card
         title="Recent Sales Orders"
-        subtitle={`Latest activity · Last ${range.label}`}
+        subtitle={`Latest activity · ${range.label}`}
       >
         {loading ? (
           <div style={{ padding: 40, textAlign: "center", color: COLORS.textFaint, fontSize: 13 }}>
