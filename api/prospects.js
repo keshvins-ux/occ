@@ -534,12 +534,11 @@ async function handleOverview(req, res) {
   const days = parseDays(req);
 
   try {
-    // KPIs over the window
+    // KPIs over the window — invoiced from sql_salesinvoices
     const kpiRes = await q(
       `
       SELECT
         COALESCE(SUM(docamt::numeric), 0) AS invoiced,
-        COALESCE(SUM(paid_amt::numeric), 0) AS collected,
         COUNT(*)::int AS invoice_count
       FROM sql_salesinvoices
       WHERE docdate >= CURRENT_DATE - $1::int
@@ -547,8 +546,16 @@ async function handleOverview(req, res) {
       `,
       [days]
     );
+    // Collected from sql_receiptvouchers
+    const colRes = await q(
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
+       FROM sql_receiptvouchers
+       WHERE docdate >= CURRENT_DATE - $1::int
+         AND (cancelled = false OR cancelled IS NULL)`,
+      [days]
+    );
     const invoiced = Number(kpiRes.rows[0]?.invoiced || 0);
-    const collected = Number(kpiRes.rows[0]?.collected || 0);
+    const collected = Number(colRes.rows[0]?.collected || 0);
 
     // AR outstanding = SUM(sql_customers.outstanding)
     const arRes = await q(
@@ -560,30 +567,33 @@ async function handleOverview(req, res) {
 
     // Previous period for deltas
     const prevRes = await q(
-      `
-      SELECT
-        COALESCE(SUM(docamt::numeric), 0) AS invoiced,
-        COALESCE(SUM(paid_amt::numeric), 0) AS collected
-      FROM sql_salesinvoices
-      WHERE docdate >= CURRENT_DATE - ($1::int * 2)
-        AND docdate <  CURRENT_DATE - $1::int
-        AND (cancelled = false OR cancelled IS NULL)
-      `,
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS invoiced
+       FROM sql_salesinvoices
+       WHERE docdate >= CURRENT_DATE - ($1::int * 2)
+         AND docdate <  CURRENT_DATE - $1::int
+         AND (cancelled = false OR cancelled IS NULL)`,
+      [days]
+    );
+    const prevColRes = await q(
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
+       FROM sql_receiptvouchers
+       WHERE docdate >= CURRENT_DATE - ($1::int * 2)
+         AND docdate <  CURRENT_DATE - $1::int
+         AND (cancelled = false OR cancelled IS NULL)`,
       [days]
     );
     const prevInvoiced = Number(prevRes.rows[0]?.invoiced || 0);
-    const prevCollected = Number(prevRes.rows[0]?.collected || 0);
+    const prevCollected = Number(prevColRes.rows[0]?.collected || 0);
     const invTrendPct = prevInvoiced > 0 ? (((invoiced - prevInvoiced) / prevInvoiced) * 100).toFixed(1) : null;
     const colTrendPct = prevCollected > 0 ? (((collected - prevCollected) / prevCollected) * 100).toFixed(1) : null;
 
     // Monthly trend buckets (last 3 complete months)
-    const trendRes = await q(
+    const trendInvRes = await q(
       `
       SELECT
         TO_CHAR(DATE_TRUNC('month', docdate), 'Mon') AS label,
         DATE_TRUNC('month', docdate) AS month_start,
-        SUM(docamt::numeric) AS invoiced,
-        SUM(paid_amt::numeric) AS collected
+        SUM(docamt::numeric) AS invoiced
       FROM sql_salesinvoices
       WHERE docdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
         AND (cancelled = false OR cancelled IS NULL)
@@ -591,10 +601,25 @@ async function handleOverview(req, res) {
       ORDER BY month_start ASC
       `
     );
-    const trend = trendRes.rows.map((r) => ({
+    const trendColRes = await q(
+      `
+      SELECT
+        TO_CHAR(DATE_TRUNC('month', docdate), 'Mon') AS label,
+        DATE_TRUNC('month', docdate) AS month_start,
+        SUM(docamt::numeric) AS collected
+      FROM sql_receiptvouchers
+      WHERE docdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
+        AND (cancelled = false OR cancelled IS NULL)
+      GROUP BY month_start, label
+      ORDER BY month_start ASC
+      `
+    );
+    const colByMonth = {};
+    for (const r of trendColRes.rows) colByMonth[r.label.trim()] = Number(r.collected || 0);
+    const trend = trendInvRes.rows.map((r) => ({
       label: r.label.trim(),
       invoiced: Number(r.invoiced || 0),
-      collected: Number(r.collected || 0),
+      collected: colByMonth[r.label.trim()] || 0,
     }));
 
     // Top customers by revenue in the window
@@ -814,19 +839,21 @@ async function handleAROverview(req, res) {
 
     // Collected this period
     const collectedRes = await q(
-      `SELECT COALESCE(SUM(paid_amt::numeric), 0) AS collected
-       FROM sql_salesinvoices
-       WHERE docdate >= CURRENT_DATE - $1::int`,
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
+       FROM sql_receiptvouchers
+       WHERE docdate >= CURRENT_DATE - $1::int
+         AND (cancelled = false OR cancelled IS NULL)`,
       [days]
     );
     const collected = Number(collectedRes.rows[0]?.collected || 0);
 
     // Previous period for collected trend
     const prevColRes = await q(
-      `SELECT COALESCE(SUM(paid_amt::numeric), 0) AS collected
-       FROM sql_salesinvoices
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
+       FROM sql_receiptvouchers
        WHERE docdate >= CURRENT_DATE - ($1::int * 2)
-         AND docdate <  CURRENT_DATE - $1::int`,
+         AND docdate <  CURRENT_DATE - $1::int
+         AND (cancelled = false OR cancelled IS NULL)`,
       [days]
     );
     const prevCollected = Number(prevColRes.rows[0]?.collected || 0);

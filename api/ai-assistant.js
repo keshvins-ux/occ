@@ -1,5 +1,5 @@
 // api/ai-assistant.js
-// OCC AI Assistant — powered by Seri Rasa.
+// OCC AI Assistant — powered by Claude.
 // Read-only by design: the LLM is given access to a set of query functions that
 // return data from Postgres. It cannot write to any table.
 //
@@ -242,7 +242,6 @@ const TOOLS = {
         i.docno,
         i.docdate AS date,
         i.docamt::numeric AS amount,
-        i.paid_amt::numeric AS paid,
         i.companyname AS customer,
         i.code
       FROM sql_salesinvoices i
@@ -254,18 +253,24 @@ const TOOLS = {
       [`%${customer}%`, customer, limit]
     );
     const total = r.rows.reduce((s, row) => s + Number(row.amount), 0);
-    const paid = r.rows.reduce((s, row) => s + Number(row.paid || 0), 0);
+    // Get outstanding from sql_customers (source of truth)
+    const custCode = r.rows[0]?.code;
+    let outstanding = 0;
+    if (custCode) {
+      const oRes = await q(`SELECT outstanding::numeric AS os FROM sql_customers WHERE code = $1`, [custCode]);
+      outstanding = Number(oRes.rows[0]?.os || 0);
+    }
+    const paid = total - outstanding;
     return {
       query: customer,
       count: r.rows.length,
       total_invoiced: total,
       total_paid: paid,
-      outstanding: total - paid,
+      outstanding,
       invoices: r.rows.map((row) => ({
         docno: row.docno,
         date: row.date,
         amount: Number(row.amount),
-        paid: Number(row.paid || 0),
         customer: row.customer,
         code: row.code,
       })),
@@ -658,7 +663,7 @@ function buildUIDataFromToolResult(toolName, result) {
       items: result.invoices.slice(0, 10).map((i) => ({
         name: `${i.docno}`,
         value: fmt(i.amount),
-        meta: `${new Date(i.date).toLocaleDateString('en-MY')}${i.paid < i.amount ? ` · unpaid ${fmt(i.amount - i.paid)}` : ' · paid'}`,
+        meta: `${new Date(i.date).toLocaleDateString('en-MY')}`,
       })),
     };
   }
