@@ -356,7 +356,7 @@ export default function Layout({ active, sub, onNavigate, children }) {
             </svg>
             <span style={{ color: BRAND.accent, fontWeight: 600 }}>{currentSub}</span>
             <span style={{ color: COLORS.textGhost }}>·</span>
-            <span style={{ color: COLORS.textMuted }}>Last {range.label}</span>
+            <span style={{ color: COLORS.textMuted }}>{range.label}</span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
             <div>

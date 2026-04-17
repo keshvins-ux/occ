@@ -46,7 +46,7 @@ export default function DateRangePicker() {
         }}
       >
         <Ic name="calendar" size={14} color="currentColor" />
-        <span>Last {range.label}</span>
+        <span>{range.label}</span>
         <Ic name="chevronDown" size={12} color="currentColor" />
       </button>
       {open && (
@@ -61,12 +61,12 @@ export default function DateRangePicker() {
             border: `1px solid ${COLORS.borderStrong}`,
             padding: 6,
             zIndex: 50,
-            minWidth: 160,
+            minWidth: 220,
           }}
         >
           {DATE_PRESETS.map((p) => (
             <button
-              key={p.days}
+              key={p.key}
               onClick={() => {
                 setRange(p);
                 setOpen(false);
@@ -76,23 +76,23 @@ export default function DateRangePicker() {
                 width: "100%",
                 padding: "9px 14px",
                 fontSize: 12,
-                color: range.days === p.days ? BRAND.accent : COLORS.textSecondary,
-                background: range.days === p.days ? BRAND.accentGlow : "transparent",
+                color: range.key === p.key ? BRAND.accent : COLORS.textSecondary,
+                background: range.key === p.key ? BRAND.accentGlow : "transparent",
                 border: "none",
                 borderRadius: RADIUS.sm,
                 cursor: "pointer",
                 textAlign: "left",
-                fontWeight: range.days === p.days ? 600 : 500,
+                fontWeight: range.key === p.key ? 600 : 500,
                 transition: "all 0.12s",
               }}
               onMouseEnter={(e) => {
-                if (range.days !== p.days) e.currentTarget.style.background = COLORS.surfaceAlt;
+                if (range.key !== p.key) e.currentTarget.style.background = COLORS.surfaceAlt;
               }}
               onMouseLeave={(e) => {
-                if (range.days !== p.days) e.currentTarget.style.background = "transparent";
+                if (range.key !== p.key) e.currentTarget.style.background = "transparent";
               }}
             >
-              Last {p.label}
+              {p.label}
             </button>
           ))}
         </div>
