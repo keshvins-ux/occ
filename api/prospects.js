@@ -771,7 +771,7 @@ async function handleAROverview(req, res) {
       prorated AS (
         SELECT
           inv.age_days,
-          (inv.docamt / NULLIF(t.total_invoiced, 0)) * c.outstanding AS prorated
+          (inv.docamt / NULLIF(t.total_invoiced, 0)) * c.outstanding::numeric AS prorated
         FROM inv
         JOIN totals t ON t.code = inv.code
         JOIN sql_customers c ON c.code = inv.code
@@ -819,7 +819,7 @@ async function handleAROverview(req, res) {
       FROM sql_customers c
       LEFT JOIN latest l ON l.code = c.code
       WHERE c.outstanding::numeric > 0
-      ORDER BY c.outstanding DESC
+      ORDER BY c.outstanding::numeric DESC
       LIMIT 5
       `
     );
@@ -907,10 +907,10 @@ async function handleCustomersList(req, res) {
         GROUP BY code
       ),
       last_payment AS (
-        SELECT code, MAX(docdate) AS last_paid
+        SELECT companyname, MAX(docdate) AS last_paid
         FROM sql_receiptvouchers
         WHERE (cancelled = false OR cancelled IS NULL)
-        GROUP BY code
+        GROUP BY companyname
       )
       SELECT
         c.code,
@@ -921,8 +921,8 @@ async function handleCustomersList(req, res) {
         COALESCE(CURRENT_DATE - lp.last_paid::date, 9999) AS days_since_payment
       FROM sql_customers c
       LEFT JOIN inv_totals t ON t.code = c.code
-      LEFT JOIN last_payment lp ON lp.code = c.code
-      ORDER BY COALESCE(c.outstanding, 0) DESC, c.companyname ASC
+      LEFT JOIN last_payment lp ON lp.companyname = c.companyname
+      ORDER BY COALESCE(c.outstanding::numeric, 0) DESC, c.companyname ASC
       `
     );
     const customers = r.rows.map((row) => ({
