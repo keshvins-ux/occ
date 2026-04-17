@@ -77,7 +77,7 @@ const TOOLS = {
         COALESCE(CURRENT_DATE - l.last_inv::date, 0) AS days_since_last_invoice
       FROM sql_customers c
       LEFT JOIN latest l ON l.code = c.code
-      WHERE c.outstanding > 0
+      WHERE c.outstanding::numeric > 0
         AND COALESCE(CURRENT_DATE - l.last_inv::date, 0) >= $1
       ORDER BY days_since_last_invoice DESC, amount DESC
       LIMIT $2
@@ -153,9 +153,9 @@ const TOOLS = {
       FROM sql_stockitems
       WHERE balsqty IS NOT NULL
         AND reorderlevel IS NOT NULL
-        AND reorderlevel > 0
-        AND balsqty < reorderlevel
-      ORDER BY (reorderlevel - balsqty) DESC
+        AND reorderlevel::numeric > 0
+        AND balsqty::numeric < reorderlevel::numeric
+      ORDER BY (reorderlevel::numeric - balsqty::numeric) DESC
       LIMIT $1
       `,
       [limit]

@@ -560,7 +560,7 @@ async function handleOverview(req, res) {
     // AR outstanding = SUM(sql_customers.outstanding)
     const arRes = await q(
       `SELECT COALESCE(SUM(outstanding::numeric), 0) AS total_ar,
-              COUNT(*) FILTER (WHERE outstanding > 0) AS ar_count
+              COUNT(*) FILTER (WHERE outstanding::numeric > 0) AS ar_count
        FROM sql_customers`
     );
     const arOutstanding = Number(arRes.rows[0]?.total_ar || 0);
@@ -748,7 +748,7 @@ async function handleAROverview(req, res) {
     const arRes = await q(
       `SELECT
          COALESCE(SUM(outstanding::numeric), 0) AS total,
-         COUNT(*) FILTER (WHERE outstanding > 0) AS customers_with_ar
+         COUNT(*) FILTER (WHERE outstanding::numeric > 0) AS customers_with_ar
        FROM sql_customers`
     );
     const totalAR = Number(arRes.rows[0]?.total || 0);
@@ -775,7 +775,7 @@ async function handleAROverview(req, res) {
         FROM inv
         JOIN totals t ON t.code = inv.code
         JOIN sql_customers c ON c.code = inv.code
-        WHERE c.outstanding > 0
+        WHERE c.outstanding::numeric > 0
       )
       SELECT
         CASE
@@ -818,7 +818,7 @@ async function handleAROverview(req, res) {
         COALESCE(CURRENT_DATE - l.last_inv::date, 0) AS days
       FROM sql_customers c
       LEFT JOIN latest l ON l.code = c.code
-      WHERE c.outstanding > 0
+      WHERE c.outstanding::numeric > 0
       ORDER BY c.outstanding DESC
       LIMIT 5
       `
@@ -834,7 +834,7 @@ async function handleAROverview(req, res) {
       .reduce((s, b) => s + b.amount, 0);
 
     const overdueCount = agingRes.rows.length > 0
-      ? (await q(`SELECT COUNT(*)::int AS c FROM sql_customers WHERE outstanding > 0`)).rows[0].c
+      ? (await q(`SELECT COUNT(*)::int AS c FROM sql_customers WHERE outstanding::numeric > 0`)).rows[0].c
       : 0;
 
     // Collected this period
