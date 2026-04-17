@@ -1,5 +1,5 @@
 // api/ai-assistant.js
-// OCC AI Assistant — powered by Claude.
+// OCC AI Assistant — powered by Seri Rasa.
 // Read-only by design: the LLM is given access to a set of query functions that
 // return data from Postgres. It cannot write to any table.
 //
