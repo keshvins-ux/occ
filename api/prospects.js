@@ -1128,11 +1128,11 @@ async function handleAnalytics(req, res) {
   }
 }
 
-// Top Products — revenue, cost (from BOM), and GP
+// Top Products — revenue from sales invoice lines, cost from purchase invoice lines, GP computed
 async function handleTopProducts(req, res) {
   const days = parseDays(req);
   try {
-    // Revenue by product from invoice lines
+    // Revenue by product from sales invoice lines
     const revRes = await q(
       `
       SELECT
@@ -1154,55 +1154,80 @@ async function handleTopProducts(req, res) {
       [days]
     );
 
-    // Try to get BOM cost data from Postgres tables
-    let bomCosts = {};
+    // Purchase cost by product from purchase invoice lines (same period)
+    let purchaseCosts = {};
+    let hasCostData = false;
     try {
-      const bomRes = await q(
+      const costRes = await q(
         `
         SELECT
-          bh.itemcode AS fg_code,
-          SUM(bl.qty::numeric * bl.cost::numeric) AS unit_cost
-        FROM occ_bom_headers bh
-        JOIN occ_bom_lines bl ON bl.header_id = bh.id
-        GROUP BY bh.itemcode
-        `
+          pil.itemcode AS code,
+          SUM(pil.qty::numeric) AS qty_purchased,
+          SUM(pil.amount::numeric) AS total_cost,
+          AVG(pil.unitprice::numeric) AS avg_buy_price
+        FROM sql_pi_lines pil
+        JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
+        WHERE pi.docdate::date >= CURRENT_DATE - $1::int
+          AND (pi.cancelled = false OR pi.cancelled IS NULL)
+          AND pil.itemcode IS NOT NULL
+        GROUP BY pil.itemcode
+        `,
+        [days]
       );
-      for (const r of bomRes.rows) {
-        bomCosts[r.fg_code] = Number(r.unit_cost || 0);
+      for (const r of costRes.rows) {
+        purchaseCosts[r.code] = {
+          qtyPurchased: Number(r.qty_purchased || 0),
+          totalCost: Number(r.total_cost || 0),
+          avgBuyPrice: Number(r.avg_buy_price || 0),
+        };
       }
+      hasCostData = costRes.rows.length > 0;
     } catch (e) {
-      // BOM tables may not exist or have data yet — fall back to Redis
+      // sql_pi_lines table may not exist yet — fall back to BOM data
+      console.log('sql_pi_lines not available, trying BOM fallback:', e.message);
       try {
-        const client = await getRedisClient();
-        try {
-          const raw = await client.get('mazza_bom');
-          if (raw) {
-            const bom = JSON.parse(raw);
-            // mazza_bom is typically { itemcode: { lines: [{itemcode, qty, cost}] } }
-            if (typeof bom === 'object') {
-              for (const [fgCode, bomData] of Object.entries(bom)) {
-                if (bomData && Array.isArray(bomData.lines)) {
-                  const totalCost = bomData.lines.reduce((s, l) => s + (Number(l.qty || 0) * Number(l.cost || l.unitcost || 0)), 0);
-                  if (totalCost > 0) bomCosts[fgCode] = totalCost;
-                }
-              }
-            }
-          }
-        } finally { await client.disconnect(); }
+        const bomRes = await q(
+          `SELECT bh.itemcode AS fg_code, SUM(bl.qty::numeric * bl.cost::numeric) AS unit_cost
+           FROM occ_bom_headers bh JOIN occ_bom_lines bl ON bl.header_id = bh.id
+           GROUP BY bh.itemcode`
+        );
+        for (const r of bomRes.rows) {
+          purchaseCosts[r.fg_code] = {
+            qtyPurchased: 0,
+            totalCost: 0,
+            avgBuyPrice: Number(r.unit_cost || 0),
+            fromBom: true,
+          };
+        }
+        hasCostData = bomRes.rows.length > 0;
       } catch (e2) {
-        // No BOM data available at all
+        // No cost data at all
       }
     }
-
-    const hasBomData = Object.keys(bomCosts).length > 0;
 
     const products = revRes.rows.map((r) => {
       const revenue = Number(r.revenue || 0);
       const qtySold = Number(r.qty_sold || 0);
-      const unitCost = bomCosts[r.code] || 0;
-      const totalCost = unitCost * qtySold;
-      const gp = revenue - totalCost;
-      const gpPct = revenue > 0 ? ((gp / revenue) * 100).toFixed(1) : null;
+      const cost = purchaseCosts[r.code];
+
+      let totalCost = null;
+      let avgBuyPrice = null;
+      let gp = null;
+      let gpPct = null;
+
+      if (cost) {
+        if (cost.fromBom) {
+          // BOM fallback: unit cost × qty sold
+          totalCost = cost.avgBuyPrice * qtySold;
+          avgBuyPrice = cost.avgBuyPrice;
+        } else {
+          // Real purchase data: use actual purchase total for the period
+          totalCost = cost.totalCost;
+          avgBuyPrice = cost.avgBuyPrice;
+        }
+        gp = revenue - totalCost;
+        gpPct = revenue > 0 ? ((gp / revenue) * 100).toFixed(1) : null;
+      }
 
       return {
         code: r.code,
@@ -1211,29 +1236,33 @@ async function handleTopProducts(req, res) {
         qtySold,
         revenue,
         avgSellPrice: Number(r.avg_sell_price || 0),
-        unitCost: unitCost > 0 ? unitCost : null,
-        totalCost: unitCost > 0 ? totalCost : null,
-        gp: unitCost > 0 ? gp : null,
-        gpPct: unitCost > 0 ? gpPct : null,
+        avgBuyPrice,
+        totalCost,
+        gp,
+        gpPct,
+        qtyPurchased: cost ? cost.qtyPurchased : null,
+        costSource: cost ? (cost.fromBom ? 'bom' : 'purchase_invoice') : null,
       };
     });
 
     const totalRevenue = products.reduce((s, p) => s + p.revenue, 0);
     const totalCost = products.reduce((s, p) => s + (p.totalCost || 0), 0);
     const totalGP = totalRevenue - totalCost;
+    const productsWithCost = products.filter((p) => p.totalCost != null).length;
 
     return res.status(200).json({
       products,
       totals: {
         revenue: totalRevenue,
-        cost: hasBomData ? totalCost : null,
-        gp: hasBomData ? totalGP : null,
-        gpPct: hasBomData && totalRevenue > 0 ? ((totalGP / totalRevenue) * 100).toFixed(1) : null,
+        cost: hasCostData ? totalCost : null,
+        gp: hasCostData ? totalGP : null,
+        gpPct: hasCostData && totalRevenue > 0 ? ((totalGP / totalRevenue) * 100).toFixed(1) : null,
       },
-      hasBomData,
-      note: hasBomData
-        ? 'Cost data from BOM. GP = Revenue - (BOM unit cost × qty sold).'
-        : 'BOM cost data not yet available. Showing revenue only. GP will be calculated once BOM costs are loaded.',
+      hasCostData,
+      productsWithCost,
+      note: hasCostData
+        ? `Cost matched from purchase invoices for ${productsWithCost}/${products.length} products. GP = Sales Revenue - Purchase Cost for the same period.`
+        : 'Purchase invoice lines not yet synced. Run /api/sync-pilines to populate cost data. GP will appear once purchase line data is available.',
       source: 'postgres',
     });
   } catch (e) {
