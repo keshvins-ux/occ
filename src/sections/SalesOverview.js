@@ -17,6 +17,8 @@ export default function SalesOverview() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [compareOpen, setCompareOpen] = useState(false);
+  const [productsData, setProductsData] = useState(null);
+  const [productsLoading, setProductsLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -26,9 +28,14 @@ export default function SalesOverview() {
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));
-    return () => {
-      cancelled = true;
-    };
+
+    setProductsLoading(true);
+    fetchJson(`/api/prospects?type=top_products&days=${range.days}`)
+      .then((resp) => !cancelled && setProductsData(resp))
+      .catch(() => {})
+      .finally(() => !cancelled && setProductsLoading(false));
+
+    return () => { cancelled = true; };
   }, [range.days]);
 
   const kpis = data?.kpis || {};
@@ -116,6 +123,103 @@ export default function SalesOverview() {
           }
         >
           <TopCustomersList items={topCustomers} loading={loading} />
+        </Card>
+      </div>
+
+      {/* Top Products with GP */}
+      <div style={{ marginBottom: 20 }}>
+        <Card
+          title="Top Products"
+          subtitle={productsData?.note || `Revenue & margin · ${range.label}`}
+          action={
+            productsData?.totals ? (
+              <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 10, color: COLORS.textFaint, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Total Revenue</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text }}>{fmt(productsData.totals.revenue)}</div>
+                </div>
+                {productsData.totals.cost != null && (
+                  <>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 10, color: COLORS.textFaint, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Total Cost</div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.danger }}>{fmt(productsData.totals.cost)}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 10, color: COLORS.textFaint, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Gross Profit</div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.success }}>{fmt(productsData.totals.gp)} ({productsData.totals.gpPct}%)</div>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : null
+          }
+        >
+          {productsLoading ? (
+            <div style={{ padding: 40, textAlign: "center", color: COLORS.textFaint, fontSize: 13 }}>Loading…</div>
+          ) : !productsData?.products?.length ? (
+            <div style={{ padding: 40, textAlign: "center", color: COLORS.textFaint, fontSize: 13 }}>No product data in this period.</div>
+          ) : (
+            <SortableTable
+              rows={productsData.products}
+              rowKey={(r) => r.code}
+              defaultSort={{ key: "revenue", dir: "desc" }}
+              columns={[
+                {
+                  key: "name",
+                  label: "Product",
+                  render: (r) => (
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text }}>{r.name}</div>
+                      <div style={{ fontSize: 11, color: COLORS.textFaint, marginTop: 2, fontFamily: FONT.mono }}>{r.code}</div>
+                    </div>
+                  ),
+                },
+                {
+                  key: "qtySold",
+                  label: "Qty Sold",
+                  align: "right",
+                  render: (r) => <span style={{ fontWeight: 500 }}>{fmt0(r.qtySold)} {r.uom || ""}</span>,
+                },
+                {
+                  key: "revenue",
+                  label: "Revenue",
+                  align: "right",
+                  render: (r) => <span style={{ fontWeight: 700, color: COLORS.text }}>{fmt(r.revenue)}</span>,
+                },
+                {
+                  key: "totalCost",
+                  label: "Cost",
+                  align: "right",
+                  render: (r) => r.totalCost != null
+                    ? <span style={{ fontWeight: 600, color: COLORS.danger }}>{fmt(r.totalCost)}</span>
+                    : <span style={{ fontSize: 11, color: COLORS.textFaint }}>No BOM</span>,
+                },
+                {
+                  key: "gp",
+                  label: "Gross Profit",
+                  align: "right",
+                  render: (r) => r.gp != null
+                    ? <span style={{ fontWeight: 700, color: r.gp >= 0 ? COLORS.success : COLORS.danger }}>{fmt(r.gp)}</span>
+                    : <span style={{ fontSize: 11, color: COLORS.textFaint }}>—</span>,
+                },
+                {
+                  key: "gpPct",
+                  label: "GP %",
+                  align: "right",
+                  render: (r) => r.gpPct != null
+                    ? (
+                      <Pill
+                        color={Number(r.gpPct) >= 30 ? COLORS.successDark : Number(r.gpPct) >= 15 ? COLORS.warningDark : COLORS.dangerDark}
+                        bg={Number(r.gpPct) >= 30 ? COLORS.successBg : Number(r.gpPct) >= 15 ? COLORS.warningBg : COLORS.dangerBg}
+                      >
+                        {r.gpPct}%
+                      </Pill>
+                    )
+                    : <span style={{ fontSize: 11, color: COLORS.textFaint }}>—</span>,
+                },
+              ]}
+            />
+          )}
         </Card>
       </div>
 
