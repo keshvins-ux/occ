@@ -11,6 +11,7 @@ import SalesAnalytics from "./sections/SalesAnalytics";
 import ManagementAROverview from "./sections/ManagementAROverview";
 import ManagementCustomers from "./sections/ManagementCustomers";
 import ManagementSOLifecycle from "./sections/ManagementSOLifecycle";
+import POIntake from "./sections/POIntake";
 import Placeholder from "./sections/Placeholder";
 
 function AppInner() {
@@ -65,15 +66,9 @@ function renderSection(section, sub) {
     if (sub === 1) return <ManagementCustomers />;
     if (sub === 2) return <ManagementSOLifecycle />;
   }
-  // PO Intake (Session 2)
+  // PO Intake
   if (section === "po") {
-    return (
-      <Placeholder
-        title="PO Intake"
-        description="AI-powered PO extraction with confidence scoring, customer self-learning, and Document Tracker with accurate SO→DO→Invoice linking. Migrating from v1 in Session 2."
-        icon="download"
-      />
-    );
+    return <POIntake />;
   }
   // Production (Session 2)
   if (section === "production") {
