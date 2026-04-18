@@ -330,7 +330,7 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     const v2Types = new Set([
       'overview', 'ar_overview', 'customers', 'so_lifecycle',
-      'pipeline', 'analytics', 'comparison',
+      'pipeline', 'analytics', 'comparison', 'top_products',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -591,11 +591,11 @@ async function handleOverview(req, res) {
     const trendInvRes = await q(
       `
       SELECT
-        TO_CHAR(DATE_TRUNC('month', docdate), 'Mon') AS label,
-        DATE_TRUNC('month', docdate) AS month_start,
+        TO_CHAR(DATE_TRUNC('month', docdate::date), 'Mon') AS label,
+        DATE_TRUNC('month', docdate::date) AS month_start,
         SUM(docamt::numeric) AS invoiced
       FROM sql_salesinvoices
-      WHERE docdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
+      WHERE docdate::date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
         AND (cancelled = false OR cancelled IS NULL)
       GROUP BY month_start, label
       ORDER BY month_start ASC
@@ -604,11 +604,11 @@ async function handleOverview(req, res) {
     const trendColRes = await q(
       `
       SELECT
-        TO_CHAR(DATE_TRUNC('month', docdate), 'Mon') AS label,
-        DATE_TRUNC('month', docdate) AS month_start,
+        TO_CHAR(DATE_TRUNC('month', docdate::date), 'Mon') AS label,
+        DATE_TRUNC('month', docdate::date) AS month_start,
         SUM(docamt::numeric) AS collected
       FROM sql_receiptvouchers
-      WHERE docdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
+      WHERE docdate::date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
         AND (cancelled = false OR cancelled IS NULL)
       GROUP BY month_start, label
       ORDER BY month_start ASC
@@ -676,10 +676,10 @@ async function handleOverview(req, res) {
     const cmpRes = await q(
       `
       SELECT
-        COALESCE(SUM(CASE WHEN DATE_TRUNC('month', docdate) = DATE_TRUNC('month', CURRENT_DATE) THEN docamt::numeric ELSE 0 END), 0) AS curr,
-        COALESCE(SUM(CASE WHEN DATE_TRUNC('month', docdate) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' THEN docamt::numeric ELSE 0 END), 0) AS prev
+        COALESCE(SUM(CASE WHEN DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE) THEN docamt::numeric ELSE 0 END), 0) AS curr,
+        COALESCE(SUM(CASE WHEN DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' THEN docamt::numeric ELSE 0 END), 0) AS prev
       FROM sql_salesinvoices
-      WHERE docdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+      WHERE docdate::date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
         AND (cancelled = false OR cancelled IS NULL)
       `
     );
@@ -766,7 +766,7 @@ async function handleAROverview(req, res) {
         WHERE (i.cancelled = false OR i.cancelled IS NULL)
       ),
       totals AS (
-        SELECT code, SUM(docamt::numeric) AS total_invoiced FROM inv GROUP BY code
+        SELECT code, SUM(docamt) AS total_invoiced FROM inv GROUP BY code
       ),
       prorated AS (
         SELECT
@@ -776,17 +776,23 @@ async function handleAROverview(req, res) {
         JOIN totals t ON t.code = inv.code
         JOIN sql_customers c ON c.code = inv.code
         WHERE c.outstanding::numeric > 0
+      ),
+      bucketed AS (
+        SELECT
+          CASE
+            WHEN age_days < 0 THEN 'Current'
+            WHEN age_days <= 30 THEN '1-30d'
+            WHEN age_days <= 60 THEN '31-60d'
+            WHEN age_days <= 90 THEN '61-90d'
+            ELSE '90d+'
+          END AS bucket,
+          prorated
+        FROM prorated
       )
       SELECT
-        CASE
-          WHEN age_days < 0 THEN 'Current'
-          WHEN age_days <= 30 THEN '1-30d'
-          WHEN age_days <= 60 THEN '31-60d'
-          WHEN age_days <= 90 THEN '61-90d'
-          ELSE '90d+'
-        END AS bucket,
+        bucket AS label,
         COALESCE(SUM(prorated), 0) AS amount
-      FROM prorated
+      FROM bucketed
       GROUP BY bucket
       ORDER BY
         CASE bucket
@@ -799,7 +805,7 @@ async function handleAROverview(req, res) {
       `
     );
     const aging = agingRes.rows.map((r) => ({
-      label: r.bucket,
+      label: r.label,
       amount: Number(r.amount || 0),
     }));
 
@@ -1122,6 +1128,120 @@ async function handleAnalytics(req, res) {
   }
 }
 
+// Top Products — revenue, cost (from BOM), and GP
+async function handleTopProducts(req, res) {
+  const days = parseDays(req);
+  try {
+    // Revenue by product from invoice lines
+    const revRes = await q(
+      `
+      SELECT
+        sol.itemcode AS code,
+        MAX(sol.description) AS name,
+        MAX(sol.uom) AS uom,
+        SUM(sol.qty::numeric) AS qty_sold,
+        SUM(sol.amount::numeric) AS revenue,
+        AVG(sol.unitprice::numeric) AS avg_sell_price
+      FROM sql_inv_lines sol
+      JOIN sql_salesinvoices si ON si.dockey = sol.dockey
+      WHERE si.docdate::date >= CURRENT_DATE - $1::int
+        AND (si.cancelled = false OR si.cancelled IS NULL)
+        AND sol.itemcode IS NOT NULL
+      GROUP BY sol.itemcode
+      ORDER BY revenue DESC
+      LIMIT 20
+      `,
+      [days]
+    );
+
+    // Try to get BOM cost data from Postgres tables
+    let bomCosts = {};
+    try {
+      const bomRes = await q(
+        `
+        SELECT
+          bh.itemcode AS fg_code,
+          SUM(bl.qty::numeric * bl.cost::numeric) AS unit_cost
+        FROM occ_bom_headers bh
+        JOIN occ_bom_lines bl ON bl.header_id = bh.id
+        GROUP BY bh.itemcode
+        `
+      );
+      for (const r of bomRes.rows) {
+        bomCosts[r.fg_code] = Number(r.unit_cost || 0);
+      }
+    } catch (e) {
+      // BOM tables may not exist or have data yet — fall back to Redis
+      try {
+        const client = await getRedisClient();
+        try {
+          const raw = await client.get('mazza_bom');
+          if (raw) {
+            const bom = JSON.parse(raw);
+            // mazza_bom is typically { itemcode: { lines: [{itemcode, qty, cost}] } }
+            if (typeof bom === 'object') {
+              for (const [fgCode, bomData] of Object.entries(bom)) {
+                if (bomData && Array.isArray(bomData.lines)) {
+                  const totalCost = bomData.lines.reduce((s, l) => s + (Number(l.qty || 0) * Number(l.cost || l.unitcost || 0)), 0);
+                  if (totalCost > 0) bomCosts[fgCode] = totalCost;
+                }
+              }
+            }
+          }
+        } finally { await client.disconnect(); }
+      } catch (e2) {
+        // No BOM data available at all
+      }
+    }
+
+    const hasBomData = Object.keys(bomCosts).length > 0;
+
+    const products = revRes.rows.map((r) => {
+      const revenue = Number(r.revenue || 0);
+      const qtySold = Number(r.qty_sold || 0);
+      const unitCost = bomCosts[r.code] || 0;
+      const totalCost = unitCost * qtySold;
+      const gp = revenue - totalCost;
+      const gpPct = revenue > 0 ? ((gp / revenue) * 100).toFixed(1) : null;
+
+      return {
+        code: r.code,
+        name: r.name,
+        uom: r.uom,
+        qtySold,
+        revenue,
+        avgSellPrice: Number(r.avg_sell_price || 0),
+        unitCost: unitCost > 0 ? unitCost : null,
+        totalCost: unitCost > 0 ? totalCost : null,
+        gp: unitCost > 0 ? gp : null,
+        gpPct: unitCost > 0 ? gpPct : null,
+      };
+    });
+
+    const totalRevenue = products.reduce((s, p) => s + p.revenue, 0);
+    const totalCost = products.reduce((s, p) => s + (p.totalCost || 0), 0);
+    const totalGP = totalRevenue - totalCost;
+
+    return res.status(200).json({
+      products,
+      totals: {
+        revenue: totalRevenue,
+        cost: hasBomData ? totalCost : null,
+        gp: hasBomData ? totalGP : null,
+        gpPct: hasBomData && totalRevenue > 0 ? ((totalGP / totalRevenue) * 100).toFixed(1) : null,
+      },
+      hasBomData,
+      note: hasBomData
+        ? 'Cost data from BOM. GP = Revenue - (BOM unit cost × qty sold).'
+        : 'BOM cost data not yet available. Showing revenue only. GP will be calculated once BOM costs are loaded.',
+      source: 'postgres',
+    });
+  } catch (e) {
+    console.error('top_products error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 // MoM Comparison — current month vs previous month for customers AND products
 async function handleComparison(req, res) {
   try {
@@ -1131,7 +1251,7 @@ async function handleComparison(req, res) {
       WITH curr_month AS (
         SELECT code, companyname, SUM(docamt::numeric) AS amt
         FROM sql_salesinvoices
-        WHERE DATE_TRUNC('month', docdate) = DATE_TRUNC('month', CURRENT_DATE)
+        WHERE DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
           AND (cancelled = false OR cancelled IS NULL)
           AND code IS NOT NULL
         GROUP BY code, companyname
@@ -1139,7 +1259,7 @@ async function handleComparison(req, res) {
       prev_month AS (
         SELECT code, companyname, SUM(docamt::numeric) AS amt
         FROM sql_salesinvoices
-        WHERE DATE_TRUNC('month', docdate) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+        WHERE DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
           AND (cancelled = false OR cancelled IS NULL)
           AND code IS NOT NULL
         GROUP BY code, companyname
@@ -1152,7 +1272,6 @@ async function handleComparison(req, res) {
       FROM curr_month c
       FULL OUTER JOIN prev_month p ON p.code = c.code
       ORDER BY COALESCE(c.amt, 0) DESC, COALESCE(p.amt, 0) DESC
-      LIMIT 30
       `
     );
     const customers = custRes.rows.map((r) => {
@@ -1173,7 +1292,7 @@ async function handleComparison(req, res) {
                SUM(sol.qty::numeric) AS qty
         FROM sql_inv_lines sol
         JOIN sql_salesinvoices si ON si.dockey = sol.dockey
-        WHERE DATE_TRUNC('month', si.docdate) = DATE_TRUNC('month', CURRENT_DATE)
+        WHERE DATE_TRUNC('month', si.docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
           AND (si.cancelled = false OR si.cancelled IS NULL)
           AND sol.itemcode IS NOT NULL
         GROUP BY sol.itemcode
@@ -1183,7 +1302,7 @@ async function handleComparison(req, res) {
                SUM(sol.qty::numeric) AS qty
         FROM sql_inv_lines sol
         JOIN sql_salesinvoices si ON si.dockey = sol.dockey
-        WHERE DATE_TRUNC('month', si.docdate) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+        WHERE DATE_TRUNC('month', si.docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
           AND (si.cancelled = false OR si.cancelled IS NULL)
           AND sol.itemcode IS NOT NULL
         GROUP BY sol.itemcode
@@ -1197,7 +1316,6 @@ async function handleComparison(req, res) {
       FROM curr_month c
       FULL OUTER JOIN prev_month p ON p.code = c.code
       ORDER BY COALESCE(c.qty, 0) DESC, COALESCE(p.qty, 0) DESC
-      LIMIT 30
       `
     );
     const products = prodRes.rows.map((r) => {
@@ -1246,6 +1364,8 @@ export async function handleV2Type(req, res, type) {
       return handleAnalytics(req, res);
     case 'comparison':
       return handleComparison(req, res);
+    case 'top_products':
+      return handleTopProducts(req, res);
     default:
       return null; // not a v2 type
   }
