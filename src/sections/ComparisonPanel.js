@@ -74,7 +74,7 @@ export default function ComparisonPanel({ onClose }) {
     }
   }
 
-  // PDF download
+  // PDF download — opens report in new tab, triggers browser print dialog (Save as PDF)
   async function downloadPDF() {
     setPdfLoading(true);
     try {
@@ -90,16 +90,16 @@ export default function ComparisonPanel({ onClose }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(reportData),
       });
-      if (!resp.ok) throw new Error("PDF generation failed");
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `OCC_MoM_Report_${new Date().toISOString().slice(0, 10)}.pdf`;
-      a.click();
-      URL.revokeObjectURL(url);
+      if (!resp.ok) throw new Error("Report generation failed");
+      const html = await resp.text();
+      // Open in new tab and trigger print (Save as PDF)
+      const win = window.open("", "_blank");
+      win.document.write(html);
+      win.document.close();
+      // Small delay to let styles render, then trigger print
+      setTimeout(() => win.print(), 500);
     } catch (e) {
-      alert("Failed to generate PDF: " + e.message);
+      alert("Failed to generate report: " + e.message);
     } finally {
       setPdfLoading(false);
     }
