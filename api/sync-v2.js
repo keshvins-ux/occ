@@ -1,25 +1,16 @@
 // ============================================================
-// V2 SYNC — PERMANENT, SELF-HEALING
+// V2 SYNC — SMART, PERMANENT, SELF-HEALING
 //
 // Strategy:
-//   1. Fetch ALL records from SQL Account API for one table
-//   2. UPSERT every record into Postgres (INSERT or UPDATE)
-//   3. No watermark — every record is processed every run
-//   4. One table per cron call (avoids 60s timeout)
+//   1. Fetch ALL dockey+docamt+docdate from Postgres (fast — single query)
+//   2. Fetch ALL records from SQL Account API
+//   3. Compare: find records that are MISSING or CHANGED
+//   4. UPSERT only the missing/changed ones (typically <50 per run)
+//   5. Full 1057 records fetched, but only ~5-20 upserts needed = fast
 //
-// This means:
-//   - Missing records get inserted immediately
-//   - Changed records (amount, status, cancelled) get updated
-//   - Deleted/cancelled records get their cancelled flag updated
-//   - No record can ever be permanently "missed"
-//
-// Cron schedule (in vercel.json):
-//   salesinvoices:    every 10 min
-//   receiptvouchers:  every 10 min (offset +2)
-//   salesorders:      every 10 min (offset +4)
-//   deliveryorders:   every 10 min (offset +6)
-//   customers:        every 2 hours
-//   stockitems:       every 2 hours
+// This avoids the timeout problem of upserting all 1057 every time.
+// On first run after deployment, it may need multiple passes.
+// After that, each run only processes genuinely new/changed records.
 //
 // GET /api/sync-v2?table=salesinvoices  → sync one table
 // GET /api/sync-v2?status=true          → show all counts
@@ -40,12 +31,55 @@ async function q(sql, params = []) {
 }
 
 const TABLES = {
-  salesinvoices:   { endpoint: '/salesinvoice',   pg: 'sql_salesinvoices',   upsert: upsertInvoice },
-  receiptvouchers: { endpoint: '/receiptvoucher', pg: 'sql_receiptvouchers', upsert: upsertRV },
-  salesorders:     { endpoint: '/salesorder',     pg: 'sql_salesorders',     upsert: upsertSO },
-  deliveryorders:  { endpoint: '/deliveryorder',  pg: 'sql_deliveryorders',  upsert: upsertDO },
-  customers:       { endpoint: '/customer',       pg: 'sql_customers',       upsert: upsertCustomer },
-  stockitems:      { endpoint: '/stockitem',      pg: 'sql_stockitems',      upsert: upsertStockItem },
+  salesinvoices: {
+    endpoint: '/salesinvoice',
+    pg: 'sql_salesinvoices',
+    // Fields to compare for detecting changes
+    compareQuery: `SELECT dockey, docamt, docdate::text AS docdate, cancelled FROM sql_salesinvoices`,
+    compareKey: r => `${r.dockey}|${r.docamt}|${r.docdate}|${r.cancelled}`,
+    apiKey: r => `${r.dockey}|${safe(r.docamt)}|${safeDate(r.docdate)}|${r.cancelled ?? false}`,
+    upsert: upsertInvoice,
+  },
+  receiptvouchers: {
+    endpoint: '/receiptvoucher',
+    pg: 'sql_receiptvouchers',
+    compareQuery: `SELECT dockey, docamt, docdate::text AS docdate, cancelled FROM sql_receiptvouchers`,
+    compareKey: r => `${r.dockey}|${r.docamt}|${r.docdate}|${r.cancelled}`,
+    apiKey: r => `${r.dockey}|${safe(r.docamt)}|${safeDate(r.docdate)}|${r.cancelled ?? false}`,
+    upsert: upsertRV,
+  },
+  salesorders: {
+    endpoint: '/salesorder',
+    pg: 'sql_salesorders',
+    compareQuery: `SELECT dockey, docamt, docdate::text AS docdate, cancelled, docref3 FROM sql_salesorders`,
+    compareKey: r => `${r.dockey}|${r.docamt}|${r.docdate}|${r.cancelled}|${r.docref3}`,
+    apiKey: r => `${r.dockey}|${safe(r.docamt)}|${safeDate(r.docdate)}|${r.cancelled ?? false}|${safe(r.docref3)}`,
+    upsert: upsertSO,
+  },
+  deliveryorders: {
+    endpoint: '/deliveryorder',
+    pg: 'sql_deliveryorders',
+    compareQuery: `SELECT dockey, docamt, docdate::text AS docdate, cancelled FROM sql_deliveryorders`,
+    compareKey: r => `${r.dockey}|${r.docamt}|${r.docdate}|${r.cancelled}`,
+    apiKey: r => `${r.dockey}|${safe(r.docamt)}|${safeDate(r.docdate)}|${r.cancelled ?? false}`,
+    upsert: upsertDO,
+  },
+  customers: {
+    endpoint: '/customer',
+    pg: 'sql_customers',
+    compareQuery: `SELECT dockey, outstanding, status FROM sql_customers`,
+    compareKey: r => `${r.dockey}|${r.outstanding}|${r.status}`,
+    apiKey: r => `${r.dockey}|${safe(r.outstanding)}|${safe(r.status)}`,
+    upsert: upsertCustomer,
+  },
+  stockitems: {
+    endpoint: '/stockitem',
+    pg: 'sql_stockitems',
+    compareQuery: `SELECT dockey, balsqty, isactive FROM sql_stockitems`,
+    compareKey: r => `${r.dockey}|${r.balsqty}|${r.isactive}`,
+    apiKey: r => `${r.dockey}|${safe(r.balsqty)}|${r.isactive ?? true}`,
+    upsert: upsertStockItem,
+  },
 };
 
 export default async function handler(req, res) {
@@ -56,7 +90,6 @@ export default async function handler(req, res) {
   const { table, status } = req.query || {};
 
   try {
-    // Status — show counts for all tables
     if (status === 'true') {
       const counts = {};
       for (const [name, cfg] of Object.entries(TABLES)) {
@@ -66,75 +99,77 @@ export default async function handler(req, res) {
       return res.status(200).json({ tables: counts, ms: Date.now() - started });
     }
 
-    // Must specify a table
     if (!table) {
       return res.status(400).json({
-        error: 'Specify ?table=salesinvoices (or receiptvouchers, salesorders, deliveryorders, customers, stockitems)',
+        error: 'Specify ?table=salesinvoices',
         validTables: Object.keys(TABLES),
       });
     }
 
     const cfg = TABLES[table];
-    if (!cfg) {
-      return res.status(400).json({ error: `Unknown table: ${table}`, validTables: Object.keys(TABLES) });
-    }
+    if (!cfg) return res.status(400).json({ error: `Unknown: ${table}` });
 
-    // Fetch ALL records from SQL Account API
-    let offset = 0, apiRecords = [];
+    // Step 1: Get existing records fingerprint from Postgres (fast — one query)
+    const existingRes = await q(cfg.compareQuery);
+    const existingFingerprints = new Set(existingRes.rows.map(cfg.compareKey));
+    const existingDockets = new Set(existingRes.rows.map(r => r.dockey));
+    const pgBefore = existingDockets.size;
+
+    // Step 2: Fetch ALL from SQL Account API
+    let offset = 0, apiTotal = 0;
+    const toUpsert = []; // only records that are NEW or CHANGED
+
     while (true) {
-      if (Date.now() - started > 45000) break; // safety: stop before 60s
+      if (Date.now() - started > 35000) break; // leave 25s for upserts
       const { blocked, records } = await fetchPage(cfg.endpoint, offset);
-      if (blocked) return res.status(200).json({ table, error: 'API blocked', ms: Date.now() - started });
+      if (blocked) return res.status(200).json({ table, error: 'API blocked' });
       if (!records.length) break;
-      apiRecords.push(...records);
+      apiTotal += records.length;
+
+      for (const r of records) {
+        const fingerprint = cfg.apiKey(r);
+        if (!existingFingerprints.has(fingerprint)) {
+          // This record is either NEW (dockey not in Postgres) or CHANGED (different docamt/date/status)
+          toUpsert.push(r);
+        }
+      }
       offset += records.length;
     }
 
-    if (apiRecords.length === 0) {
+    if (apiTotal === 0) {
       return res.status(200).json({
-        table, error: 'API returned 0 records — check SQL Account API credentials',
+        table, error: 'API returned 0 records',
         debug: {
-          endpoint: cfg.endpoint,
           host: process.env.SQL_HOST ? 'set' : 'MISSING',
           accessKey: process.env.SQL_ACCESS_KEY ? 'set' : 'MISSING',
           secretKey: process.env.SQL_SECRET_KEY ? 'set' : 'MISSING',
-          region: process.env.SQL_REGION || 'MISSING',
-          service: process.env.SQL_SERVICE || 'MISSING',
         },
         ms: Date.now() - started,
       });
     }
 
-    // Count before
-    const beforeRes = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
-    const pgBefore = beforeRes.rows[0].c;
-
-    // UPSERT every record
+    // Step 3: Upsert only the changed/new records
     let upserted = 0, errors = 0, errorSamples = [];
-    for (const r of apiRecords) {
-      if (Date.now() - started > 55000) break; // hard stop
+    for (const r of toUpsert) {
+      if (Date.now() - started > 55000) break;
       try {
         await cfg.upsert(r);
         upserted++;
       } catch (e) {
         errors++;
-        if (errorSamples.length < 3) {
-          errorSamples.push({ dockey: r.dockey, docno: r.docno, error: e.message.slice(0, 100) });
-        }
+        if (errorSamples.length < 3) errorSamples.push({ dockey: r.dockey, error: e.message.slice(0, 100) });
       }
     }
 
-    // Count after
+    // Step 4: Count after
     const afterRes = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
-    const pgAfter = afterRes.rows[0].c;
-    const newRecords = pgAfter - pgBefore;
 
     return res.status(200).json({
       table,
-      apiFetched: apiRecords.length,
+      apiFetched: apiTotal,
       pgBefore,
-      pgAfter,
-      newRecords,
+      pgAfter: afterRes.rows[0].c,
+      newOrChanged: toUpsert.length,
       upserted,
       errors,
       errorSamples: errorSamples.length > 0 ? errorSamples : undefined,
@@ -143,15 +178,11 @@ export default async function handler(req, res) {
 
   } catch (e) {
     console.error('sync-v2 error:', e);
-    return res.status(500).json({ error: e.message, ms: Date.now() - started });
+    return res.status(500).json({ error: e.message });
   }
 }
 
 // ── UPSERT FUNCTIONS ──────────────────────────────────────────
-// Each function does INSERT ... ON CONFLICT DO UPDATE
-// This means EVERY record is processed:
-//   - New dockey → INSERT
-//   - Existing dockey → UPDATE (docamt, cancelled, status, etc.)
 
 async function upsertInvoice(r) {
   await q(`
