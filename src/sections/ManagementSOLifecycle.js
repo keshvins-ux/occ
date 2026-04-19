@@ -21,7 +21,7 @@ export default function ManagementSOLifecycle() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchJson(`/api/prospects?type=so_lifecycle&days=${range.days}`)
+    fetchJson(`/api/prospects?type=so_lifecycle&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
       .then((resp) => !cancelled && setSOs(resp?.sos || []))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));

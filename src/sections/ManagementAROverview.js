@@ -18,7 +18,7 @@ export default function ManagementAROverview() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchJson(`/api/prospects?type=ar_overview&days=${range.days}`)
+    fetchJson(`/api/prospects?type=ar_overview&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));

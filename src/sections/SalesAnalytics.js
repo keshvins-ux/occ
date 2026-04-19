@@ -17,7 +17,7 @@ export default function SalesAnalytics() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchJson(`/api/prospects?type=analytics&days=${range.days}`)
+    fetchJson(`/api/prospects?type=analytics&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));

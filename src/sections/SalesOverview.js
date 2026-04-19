@@ -24,13 +24,13 @@ export default function SalesOverview() {
     let cancelled = false;
     setLoading(true);
     setError("");
-    fetchJson(`/api/prospects?type=overview&days=${range.days}`)
+    fetchJson(`/api/prospects?type=overview&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));
 
     setProductsLoading(true);
-    fetchJson(`/api/prospects?type=top_products&days=${range.days}`)
+    fetchJson(`/api/prospects?type=top_products&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
       .then((resp) => !cancelled && setProductsData(resp))
       .catch(() => {})
       .finally(() => !cancelled && setProductsLoading(false));
