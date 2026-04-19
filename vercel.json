@@ -3,5 +3,9 @@
     "api/*.js": {
       "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    { "path": "/api/sync-v2", "schedule": "*/15 * * * *" },
+    { "path": "/api/sync-pilines", "schedule": "*/15 * * * *" }
+  ]
 }
