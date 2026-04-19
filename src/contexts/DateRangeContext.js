@@ -1,14 +1,14 @@
 import { createContext, useContext, useState, useEffect, useMemo } from "react";
 
-// Dynamic presets — "This month" and "Last month" compute days on the fly
+// Dynamic presets — calendar-precise start dates for months
 function buildPresets() {
   const now = new Date();
-  const dayOfMonth = now.getDate(); // e.g. 18 on April 18th
+  const dayOfMonth = now.getDate();
 
-  // Last month: full previous month
-  const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0); // last day of prev month
-  const lastMonthDays = lastMonthEnd.getDate(); // e.g. 31 for March
-  const lastMonthTotalDays = dayOfMonth + lastMonthDays; // from 1st of last month to today
+  // This month: from 1st of current month
+  const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  // Last month: from 1st of previous month
+  const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
   const monthNames = [
     "January", "February", "March", "April", "May", "June",
@@ -17,9 +17,12 @@ function buildPresets() {
   const thisMonthName = monthNames[now.getMonth()];
   const lastMonthName = monthNames[(now.getMonth() + 11) % 12];
 
+  // Format as YYYY-MM-DD for the API
+  const fmtDate = (d) => d.toISOString().slice(0, 10);
+
   return [
-    { label: `This Month (${thisMonthName})`, days: dayOfMonth, key: "this_month" },
-    { label: `Last Month (${lastMonthName})`, days: lastMonthTotalDays, key: "last_month" },
+    { label: `This Month (${thisMonthName})`, days: dayOfMonth, key: "this_month", fromDate: fmtDate(thisMonthStart) },
+    { label: `Last Month (${lastMonthName})`, days: dayOfMonth + new Date(now.getFullYear(), now.getMonth(), 0).getDate(), key: "last_month", fromDate: fmtDate(lastMonthStart) },
     { label: "90 days", days: 90, key: "90" },
     { label: "180 days", days: 180, key: "180" },
     { label: "365 days", days: 365, key: "365" },
@@ -80,6 +83,11 @@ export function DateRangeProvider({ children }) {
       prevTo,
       days: range.days,
       label: range.label,
+      fromDate: range.fromDate || null,
+      // Helper: build query string for API calls — uses fromDate when available
+      apiQuery: range.fromDate
+        ? `days=${range.days}&from=${range.fromDate}`
+        : `days=${range.days}`,
     };
   }, [range]);
 
