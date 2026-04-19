@@ -330,7 +330,7 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     const v2Types = new Set([
       'overview', 'ar_overview', 'customers', 'so_lifecycle',
-      'pipeline', 'analytics', 'comparison', 'top_products',
+      'pipeline', 'analytics', 'comparison', 'comparison_detail', 'comparison_brief', 'top_products',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -1391,6 +1391,218 @@ async function handleComparison(req, res) {
   }
 }
 
+// Comparison Detail — SOs per customer for both months (expandable rows)
+async function handleComparisonDetail(req, res) {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ error: 'code parameter required' });
+
+  try {
+    const currSOs = await q(
+      `SELECT so.docno, so.docdate, so.docamt::numeric AS amount, so.companyname AS customer,
+              so.cancelled, so.docref3,
+              CASE WHEN so.cancelled = true THEN 'cancelled'
+                   WHEN UPPER(COALESCE(so.docref3,'')) = 'DONE' THEN 'complete'
+                   ELSE 'active' END AS status
+       FROM sql_salesorders so
+       WHERE so.code = $1
+         AND DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
+         AND (so.cancelled = false OR so.cancelled IS NULL)
+       ORDER BY so.docdate DESC, so.docno DESC`,
+      [code]
+    );
+    const prevSOs = await q(
+      `SELECT so.docno, so.docdate, so.docamt::numeric AS amount, so.companyname AS customer,
+              so.cancelled, so.docref3,
+              CASE WHEN so.cancelled = true THEN 'cancelled'
+                   WHEN UPPER(COALESCE(so.docref3,'')) = 'DONE' THEN 'complete'
+                   ELSE 'active' END AS status
+       FROM sql_salesorders so
+       WHERE so.code = $1
+         AND DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+         AND (so.cancelled = false OR so.cancelled IS NULL)
+       ORDER BY so.docdate DESC, so.docno DESC`,
+      [code]
+    );
+
+    return res.status(200).json({
+      code,
+      currentMonth: currSOs.rows.map(r => ({
+        docno: r.docno, date: r.docdate, amount: Number(r.amount || 0), status: r.status,
+      })),
+      previousMonth: prevSOs.rows.map(r => ({
+        docno: r.docno, date: r.docdate, amount: Number(r.amount || 0), status: r.status,
+      })),
+    });
+  } catch (e) {
+    console.error('comparison_detail error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Comparison Brief — AI-generated CEO insights using Opus
+async function handleComparisonBrief(req, res) {
+  try {
+    // Gather data for the AI to analyse
+    const custRes = await q(
+      `WITH curr AS (
+        SELECT code, companyname, SUM(docamt::numeric) AS amt
+        FROM sql_salesinvoices
+        WHERE DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
+          AND (cancelled = false OR cancelled IS NULL) AND code IS NOT NULL
+        GROUP BY code, companyname
+      ), prev AS (
+        SELECT code, companyname, SUM(docamt::numeric) AS amt
+        FROM sql_salesinvoices
+        WHERE DATE_TRUNC('month', docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND (cancelled = false OR cancelled IS NULL) AND code IS NOT NULL
+        GROUP BY code, companyname
+      )
+      SELECT COALESCE(c.code, p.code) AS code, COALESCE(c.companyname, p.companyname) AS name,
+             COALESCE(p.amt, 0) AS prev_amt, COALESCE(c.amt, 0) AS curr_amt
+      FROM curr c FULL OUTER JOIN prev p ON p.code = c.code
+      ORDER BY COALESCE(c.amt, 0) DESC`
+    );
+
+    const arRes = await q(
+      `SELECT COALESCE(SUM(outstanding::numeric), 0) AS total_ar,
+              COUNT(*) FILTER (WHERE outstanding::numeric > 0) AS ar_count
+       FROM sql_customers`
+    );
+
+    const prodRes = await q(
+      `WITH curr AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name, SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_inv_lines sol JOIN sql_salesinvoices si ON si.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', si.docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
+          AND (si.cancelled = false OR si.cancelled IS NULL) AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      ), prev AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name, SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_inv_lines sol JOIN sql_salesinvoices si ON si.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', si.docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND (si.cancelled = false OR si.cancelled IS NULL) AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      )
+      SELECT COALESCE(c.itemcode, p.itemcode) AS code, COALESCE(c.name, p.name) AS name,
+             COALESCE(p.revenue, 0) AS prev_rev, COALESCE(c.revenue, 0) AS curr_rev,
+             COALESCE(p.qty, 0) AS prev_qty, COALESCE(c.qty, 0) AS curr_qty
+      FROM curr c FULL OUTER JOIN prev p ON p.itemcode = c.itemcode
+      ORDER BY COALESCE(c.revenue, 0) DESC`
+    );
+
+    const monthName = new Date().toLocaleString('en-MY', { month: 'long', year: 'numeric' });
+    const prev = new Date();
+    prev.setMonth(prev.getMonth() - 1);
+    const prevName = prev.toLocaleString('en-MY', { month: 'long', year: 'numeric' });
+
+    const totalCurr = custRes.rows.reduce((s, r) => s + Number(r.curr_amt), 0);
+    const totalPrev = custRes.rows.reduce((s, r) => s + Number(r.prev_amt), 0);
+    const deltaPct = totalPrev > 0 ? (((totalCurr - totalPrev) / totalPrev) * 100).toFixed(1) : 0;
+
+    // Build context for Opus
+    const declining = custRes.rows.filter(r => Number(r.curr_amt) < Number(r.prev_amt) && Number(r.prev_amt) > 0)
+      .map(r => `${r.name}: RM ${Number(r.prev_amt).toFixed(0)} → RM ${Number(r.curr_amt).toFixed(0)} (${((Number(r.curr_amt) - Number(r.prev_amt)) / Number(r.prev_amt) * 100).toFixed(0)}%)`);
+    const churned = custRes.rows.filter(r => Number(r.curr_amt) === 0 && Number(r.prev_amt) > 0)
+      .map(r => `${r.name}: RM ${Number(r.prev_amt).toFixed(0)} last month, RM 0 this month`);
+    const newCust = custRes.rows.filter(r => Number(r.prev_amt) === 0 && Number(r.curr_amt) > 0)
+      .map(r => `${r.name}: RM ${Number(r.curr_amt).toFixed(0)} (new this month)`);
+    const growing = custRes.rows.filter(r => Number(r.curr_amt) > Number(r.prev_amt) && Number(r.prev_amt) > 0)
+      .map(r => `${r.name}: RM ${Number(r.prev_amt).toFixed(0)} → RM ${Number(r.curr_amt).toFixed(0)} (+${((Number(r.curr_amt) - Number(r.prev_amt)) / Number(r.prev_amt) * 100).toFixed(0)}%)`);
+
+    const prompt = `You are a business analyst for Seri Rasa (Rempah Emas), a Malaysian halal spice manufacturer. The CEO needs a brief executive summary comparing this month's sales performance against last month.
+
+DATA:
+- ${prevName} total invoiced: RM ${totalPrev.toFixed(2)}
+- ${monthName} total invoiced (month-to-date): RM ${totalCurr.toFixed(2)}
+- Change: ${deltaPct}%
+- AR Outstanding: RM ${Number(arRes.rows[0]?.total_ar || 0).toFixed(2)} across ${arRes.rows[0]?.ar_count || 0} customers
+- Note: ${monthName} is month-to-date (${new Date().getDate()} days in), ${prevName} is a full month
+
+DECLINING CUSTOMERS (${declining.length}):
+${declining.slice(0, 10).join('\n') || 'None'}
+
+CHURNED (ordered last month, nothing this month) (${churned.length}):
+${churned.slice(0, 10).join('\n') || 'None'}
+
+NEW CUSTOMERS THIS MONTH (${newCust.length}):
+${newCust.slice(0, 5).join('\n') || 'None'}
+
+GROWING CUSTOMERS (${growing.length}):
+${growing.slice(0, 5).join('\n') || 'None'}
+
+TOP PRODUCTS BY REVENUE CHANGE:
+${prodRes.rows.slice(0, 10).map(r => `${r.name} (${r.code}): RM ${Number(r.prev_rev).toFixed(0)} → RM ${Number(r.curr_rev).toFixed(0)}`).join('\n')}
+
+Write a concise CEO brief (3-4 paragraphs) covering:
+1. Performance summary — headline numbers, context (month-to-date vs full month)
+2. Key concerns — which customers declined or churned, why this might be happening, revenue at risk
+3. Opportunities — growing customers, new accounts, product trends
+4. Recommended actions — specific, actionable steps the sales team should take THIS WEEK
+
+Tone: direct, data-driven, no fluff. Use exact RM figures. Write for a CEO who has 2 minutes to read this.
+
+IMPORTANT: Return ONLY a JSON object with this structure:
+{
+  "summary": "One-line headline (e.g. 'Revenue down 60% month-to-date — 5 key accounts need attention')",
+  "brief": "The full 3-4 paragraph analysis",
+  "actions": ["Action 1", "Action 2", "Action 3", "Action 4"],
+  "risk_amount": 12345.00,
+  "opportunity_amount": 6789.00
+}`;
+
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) {
+      return res.status(200).json({
+        summary: 'AI brief unavailable — ANTHROPIC_API_KEY not configured',
+        brief: '', actions: [], risk_amount: 0, opportunity_amount: 0,
+      });
+    }
+
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': anthropicKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 2000,
+        system: 'You are a business analyst. Respond ONLY with a valid JSON object. No text before or after.',
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const aiData = await aiRes.json();
+    const aiText = aiData.content?.[0]?.text || '{}';
+
+    // Extract JSON (same robust extraction as PO Intake)
+    let brief;
+    try {
+      const trimmed = aiText.trim();
+      if (trimmed.startsWith('{')) {
+        brief = JSON.parse(trimmed);
+      } else {
+        const start = trimmed.indexOf('{');
+        const end = trimmed.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+          brief = JSON.parse(trimmed.slice(start, end + 1));
+        }
+      }
+    } catch {
+      brief = { summary: 'AI analysis completed', brief: aiText, actions: [], risk_amount: 0, opportunity_amount: 0 };
+    }
+
+    return res.status(200).json({
+      ...brief,
+      dataContext: { totalCurr, totalPrev, deltaPct, monthName, prevName },
+    });
+  } catch (e) {
+    console.error('comparison_brief error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 // Wrapper that dispatches new v2 types. Called from the main handler export.
 // We intercept at the top of the export by checking for v2 types.
 export async function handleV2Type(req, res, type) {
@@ -1409,6 +1621,10 @@ export async function handleV2Type(req, res, type) {
       return handleAnalytics(req, res);
     case 'comparison':
       return handleComparison(req, res);
+    case 'comparison_detail':
+      return handleComparisonDetail(req, res);
+    case 'comparison_brief':
+      return handleComparisonBrief(req, res);
     case 'top_products':
       return handleTopProducts(req, res);
     default:
