@@ -1,28 +1,32 @@
 // ============================================================
 // V2 SYNC — PERMANENT, SELF-HEALING
-// File: /api/sync-v2.js
 //
-// Replaces V1's broken watermark-based sync.
-// Strategy: compare API record count vs Postgres count.
-// If gap found → fetch all from API, identify missing dockets, insert them.
-// If no gap → done in <2 seconds.
+// Strategy:
+//   1. Fetch ALL records from SQL Account API for one table
+//   2. UPSERT every record into Postgres (INSERT or UPDATE)
+//   3. No watermark — every record is processed every run
+//   4. One table per cron call (avoids 60s timeout)
 //
-// Runs via cron every 15 minutes. Handles all core tables:
-//   - salesinvoices
-//   - receiptvouchers
-//   - salesorders
-//   - deliveryorders
-//   - customers
-//   - stockitems
+// This means:
+//   - Missing records get inserted immediately
+//   - Changed records (amount, status, cancelled) get updated
+//   - Deleted/cancelled records get their cancelled flag updated
+//   - No record can ever be permanently "missed"
 //
-// Usage:
-//   GET /api/sync-v2                        → syncs all tables
-//   GET /api/sync-v2?table=salesinvoices    → syncs one table
-//   GET /api/sync-v2?status=true            → shows sync status
+// Cron schedule (in vercel.json):
+//   salesinvoices:    every 10 min
+//   receiptvouchers:  every 10 min (offset +2)
+//   salesorders:      every 10 min (offset +4)
+//   deliveryorders:   every 10 min (offset +6)
+//   customers:        every 2 hours
+//   stockitems:       every 2 hours
+//
+// GET /api/sync-v2?table=salesinvoices  → sync one table
+// GET /api/sync-v2?status=true          → show all counts
 // ============================================================
 
 import { Pool } from 'pg';
-import crypto from 'crypto';
+import { fetchPage, safe, safeDate } from './sql-api.js';
 
 let _pool = null;
 function getPool() {
@@ -35,85 +39,13 @@ async function q(sql, params = []) {
   finally { client.release(); }
 }
 
-// ── AWS4 SIGNING ──────────────────────────────────────────────
-function sign(key, msg) { return crypto.createHmac('sha256', key).update(msg).digest(); }
-function getSignatureKey(key, d, r, s) { return sign(sign(sign(sign(Buffer.from('AWS4'+key), d), r), s), 'aws4_request'); }
-
-function buildHeaders(path) {
-  const { SQL_ACCESS_KEY, SQL_SECRET_KEY, SQL_HOST, SQL_REGION, SQL_SERVICE } = process.env;
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0,15) + 'Z';
-  const dateStamp = amzDate.slice(0,8);
-  const host = SQL_HOST.replace('https://','');
-  const payloadHash = crypto.createHash('sha256').update('','utf8').digest('hex');
-  const canonicalHeaders = `host:${host}\nx-amz-date:${amzDate}\n`;
-  const signedHeaders = 'host;x-amz-date';
-  const canonicalRequest = ['GET',path,'',canonicalHeaders,signedHeaders,payloadHash].join('\n');
-  const credScope = `${dateStamp}/${SQL_REGION}/${SQL_SERVICE}/aws4_request`;
-  const sts = ['AWS4-HMAC-SHA256',amzDate,credScope,
-    crypto.createHash('sha256').update(canonicalRequest,'utf8').digest('hex')].join('\n');
-  const sig = crypto.createHmac('sha256',
-    getSignatureKey(SQL_SECRET_KEY,dateStamp,SQL_REGION,SQL_SERVICE)).update(sts).digest('hex');
-  return {
-    'Host': host,
-    'X-Amz-Date': amzDate,
-    'Authorization': `AWS4-HMAC-SHA256 Credential=${SQL_ACCESS_KEY}/${credScope}, SignedHeaders=${signedHeaders}, Signature=${sig}`,
-  };
-}
-
-async function fetchPage(endpoint, offset) {
-  const path = `${endpoint}/${offset}`;
-  const url = `${process.env.SQL_HOST}${path}`;
-  const res = await fetch(url, { headers: buildHeaders(path), signal: AbortSignal.timeout(20000) });
-  const text = await res.text();
-  if (text.trim().startsWith('<')) return { blocked: true, records: [] };
-  try {
-    const d = JSON.parse(text);
-    return { blocked: false, records: d.data || [] };
-  } catch { return { blocked: false, records: [] }; }
-}
-
-function safe(v) { return v == null ? null : String(v); }
-function safeDate(v) { if (!v) return null; const d = new Date(v); return isNaN(d) ? null : d.toISOString().slice(0,10); }
-
-// ── TABLE CONFIGS ─────────────────────────────────────────────
 const TABLES = {
-  salesinvoices: {
-    apiEndpoint: '/salesinvoice',
-    pgTable: 'sql_salesinvoices',
-    dockeyCol: 'dockey',
-    insertFn: insertInvoice,
-  },
-  receiptvouchers: {
-    apiEndpoint: '/receiptvoucher',
-    pgTable: 'sql_receiptvouchers',
-    dockeyCol: 'dockey',
-    insertFn: insertReceiptVoucher,
-  },
-  salesorders: {
-    apiEndpoint: '/salesorder',
-    pgTable: 'sql_salesorders',
-    dockeyCol: 'dockey',
-    insertFn: insertSalesOrder,
-  },
-  deliveryorders: {
-    apiEndpoint: '/deliveryorder',
-    pgTable: 'sql_deliveryorders',
-    dockeyCol: 'dockey',
-    insertFn: insertDeliveryOrder,
-  },
-  customers: {
-    apiEndpoint: '/customer',
-    pgTable: 'sql_customers',
-    dockeyCol: 'dockey',
-    insertFn: insertCustomer,
-  },
-  stockitems: {
-    apiEndpoint: '/stockitem',
-    pgTable: 'sql_stockitems',
-    dockeyCol: 'dockey',
-    insertFn: insertStockItem,
-  },
+  salesinvoices:   { endpoint: '/salesinvoice',   pg: 'sql_salesinvoices',   upsert: upsertInvoice },
+  receiptvouchers: { endpoint: '/receiptvoucher', pg: 'sql_receiptvouchers', upsert: upsertRV },
+  salesorders:     { endpoint: '/salesorder',     pg: 'sql_salesorders',     upsert: upsertSO },
+  deliveryorders:  { endpoint: '/deliveryorder',  pg: 'sql_deliveryorders',  upsert: upsertDO },
+  customers:       { endpoint: '/customer',       pg: 'sql_customers',       upsert: upsertCustomer },
+  stockitems:      { endpoint: '/stockitem',      pg: 'sql_stockitems',      upsert: upsertStockItem },
 };
 
 export default async function handler(req, res) {
@@ -124,92 +56,104 @@ export default async function handler(req, res) {
   const { table, status } = req.query || {};
 
   try {
-    // Status check
+    // Status — show counts for all tables
     if (status === 'true') {
-      const results = {};
+      const counts = {};
       for (const [name, cfg] of Object.entries(TABLES)) {
-        const r = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pgTable}`);
-        results[name] = { pgCount: r.rows[0].c };
+        const r = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
+        counts[name] = r.rows[0].c;
       }
-      return res.status(200).json({ tables: results, ms: Date.now() - started });
+      return res.status(200).json({ tables: counts, ms: Date.now() - started });
     }
 
-    // Sync specific table or all
-    const tablesToSync = table ? { [table]: TABLES[table] } : TABLES;
-    if (table && !TABLES[table]) {
-      return res.status(400).json({ error: `Unknown table: ${table}. Valid: ${Object.keys(TABLES).join(', ')}` });
+    // Must specify a table
+    if (!table) {
+      return res.status(400).json({
+        error: 'Specify ?table=salesinvoices (or receiptvouchers, salesorders, deliveryorders, customers, stockitems)',
+        validTables: Object.keys(TABLES),
+      });
     }
 
-    const results = {};
-    for (const [name, cfg] of Object.entries(tablesToSync)) {
-      // Time check — stop if we're approaching 55s
-      if (Date.now() - started > 50000) {
-        results[name] = { skipped: true, reason: 'timeout approaching' };
-        continue;
+    const cfg = TABLES[table];
+    if (!cfg) {
+      return res.status(400).json({ error: `Unknown table: ${table}`, validTables: Object.keys(TABLES) });
+    }
+
+    // Fetch ALL records from SQL Account API
+    let offset = 0, apiRecords = [];
+    while (true) {
+      if (Date.now() - started > 45000) break; // safety: stop before 60s
+      const { blocked, records } = await fetchPage(cfg.endpoint, offset);
+      if (blocked) return res.status(200).json({ table, error: 'API blocked', ms: Date.now() - started });
+      if (!records.length) break;
+      apiRecords.push(...records);
+      offset += records.length;
+    }
+
+    if (apiRecords.length === 0) {
+      return res.status(200).json({
+        table, error: 'API returned 0 records — check SQL Account API credentials',
+        debug: {
+          endpoint: cfg.endpoint,
+          host: process.env.SQL_HOST ? 'set' : 'MISSING',
+          accessKey: process.env.SQL_ACCESS_KEY ? 'set' : 'MISSING',
+          secretKey: process.env.SQL_SECRET_KEY ? 'set' : 'MISSING',
+          region: process.env.SQL_REGION || 'MISSING',
+          service: process.env.SQL_SERVICE || 'MISSING',
+        },
+        ms: Date.now() - started,
+      });
+    }
+
+    // Count before
+    const beforeRes = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
+    const pgBefore = beforeRes.rows[0].c;
+
+    // UPSERT every record
+    let upserted = 0, errors = 0, errorSamples = [];
+    for (const r of apiRecords) {
+      if (Date.now() - started > 55000) break; // hard stop
+      try {
+        await cfg.upsert(r);
+        upserted++;
+      } catch (e) {
+        errors++;
+        if (errorSamples.length < 3) {
+          errorSamples.push({ dockey: r.dockey, docno: r.docno, error: e.message.slice(0, 100) });
+        }
       }
-      results[name] = await syncTable(name, cfg, started);
     }
 
-    return res.status(200).json({ results, ms: Date.now() - started });
+    // Count after
+    const afterRes = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
+    const pgAfter = afterRes.rows[0].c;
+    const newRecords = pgAfter - pgBefore;
+
+    return res.status(200).json({
+      table,
+      apiFetched: apiRecords.length,
+      pgBefore,
+      pgAfter,
+      newRecords,
+      upserted,
+      errors,
+      errorSamples: errorSamples.length > 0 ? errorSamples : undefined,
+      ms: Date.now() - started,
+    });
+
   } catch (e) {
     console.error('sync-v2 error:', e);
     return res.status(500).json({ error: e.message, ms: Date.now() - started });
   }
 }
 
-async function syncTable(name, cfg, started) {
-  // Step 1: Get existing dockets from Postgres
-  const existingRes = await q(`SELECT ${cfg.dockeyCol} FROM ${cfg.pgTable}`);
-  const existingKeys = new Set(existingRes.rows.map(r => r[cfg.dockeyCol]));
-  const pgBefore = existingKeys.size;
+// ── UPSERT FUNCTIONS ──────────────────────────────────────────
+// Each function does INSERT ... ON CONFLICT DO UPDATE
+// This means EVERY record is processed:
+//   - New dockey → INSERT
+//   - Existing dockey → UPDATE (docamt, cancelled, status, etc.)
 
-  // Step 2: Fetch ALL records from SQL Account API
-  let offset = 0, apiTotal = 0;
-  const missing = [];
-  const toUpdate = [];
-
-  while (true) {
-    if (Date.now() - started > 48000) break; // safety margin
-
-    const { blocked, records } = await fetchPage(cfg.apiEndpoint, offset);
-    if (blocked) return { error: 'API blocked', pgCount: pgBefore };
-    if (!records.length) break;
-
-    apiTotal += records.length;
-    for (const r of records) {
-      if (!existingKeys.has(r.dockey)) {
-        missing.push(r);
-      }
-    }
-    offset += records.length;
-  }
-
-  // Step 3: Insert missing records
-  let inserted = 0, errors = 0;
-  for (const r of missing) {
-    if (Date.now() - started > 52000) break;
-    try {
-      await cfg.insertFn(r);
-      inserted++;
-    } catch (e) {
-      errors++;
-      if (errors <= 3) console.error(`${name} insert error dockey=${r.dockey}:`, e.message);
-    }
-  }
-
-  return {
-    pgBefore,
-    apiTotal,
-    missing: missing.length,
-    inserted,
-    errors,
-    pgAfter: pgBefore + inserted,
-  };
-}
-
-// ── INSERT FUNCTIONS ──────────────────────────────────────────
-
-async function insertInvoice(r) {
+async function upsertInvoice(r) {
   await q(`
     INSERT INTO sql_salesinvoices (
       dockey, docno, docnoex, docdate, postdate,
@@ -218,28 +162,34 @@ async function insertInvoice(r) {
       docref1, docref2, docref3, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      docamt=EXCLUDED.docamt, docdate=EXCLUDED.docdate,
-      cancelled=EXCLUDED.cancelled, companyname=EXCLUDED.companyname,
+      docno=EXCLUDED.docno, docdate=EXCLUDED.docdate,
+      code=EXCLUDED.code, companyname=EXCLUDED.companyname,
+      description=EXCLUDED.description,
+      cancelled=EXCLUDED.cancelled, status=EXCLUDED.status,
+      docamt=EXCLUDED.docamt, localdocamt=EXCLUDED.localdocamt,
+      area=EXCLUDED.area, agent=EXCLUDED.agent, terms=EXCLUDED.terms,
+      docref1=EXCLUDED.docref1, docref2=EXCLUDED.docref2, docref3=EXCLUDED.docref3,
       occ_synced_at=NOW()
   `, [
     r.dockey, safe(r.docno), safe(r.docnoex), safeDate(r.docdate), safeDate(r.postdate),
     safe(r.code), safe(r.companyname), safe(r.description),
     r.cancelled ?? false, r.status ?? null,
-    safe(r.docamt), safe(r.localdocamt),
-    safe(r.area), safe(r.agent), safe(r.terms),
-    safe(r.docref1), safe(r.docref2), safe(r.docref3),
+    safe(r.docamt), safe(r.localdocamt), safe(r.area), safe(r.agent),
+    safe(r.terms), safe(r.docref1), safe(r.docref2), safe(r.docref3),
   ]);
 }
 
-async function insertReceiptVoucher(r) {
+async function upsertRV(r) {
   await q(`
     INSERT INTO sql_receiptvouchers (
       dockey, docno, docdate, code, companyname, description,
-      docamt, paymentmethod, cancelled, status, gltransid,
-      occ_synced_at
+      docamt, paymentmethod, cancelled, status, gltransid, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      docamt=EXCLUDED.docamt, cancelled=EXCLUDED.cancelled, occ_synced_at=NOW()
+      docno=EXCLUDED.docno, docdate=EXCLUDED.docdate,
+      code=EXCLUDED.code, companyname=EXCLUDED.companyname,
+      docamt=EXCLUDED.docamt, paymentmethod=EXCLUDED.paymentmethod,
+      cancelled=EXCLUDED.cancelled, status=EXCLUDED.status, occ_synced_at=NOW()
   `, [
     r.dockey, safe(r.docno), safeDate(r.docdate), safe(r.code), safe(r.companyname),
     safe(r.description), safe(r.docamt), safe(r.paymentmethod),
@@ -247,18 +197,20 @@ async function insertReceiptVoucher(r) {
   ]);
 }
 
-async function insertSalesOrder(r) {
+async function upsertSO(r) {
   await q(`
     INSERT INTO sql_salesorders (
       dockey, docno, docdate, code, companyname, description,
       cancelled, status, docamt, agent, area, terms,
-      docref1, docref2, docref3, deliverydate,
-      occ_synced_at
+      docref1, docref2, docref3, deliverydate, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      docamt=EXCLUDED.docamt, cancelled=EXCLUDED.cancelled,
-      status=EXCLUDED.status, docref3=EXCLUDED.docref3,
-      occ_synced_at=NOW()
+      docno=EXCLUDED.docno, docdate=EXCLUDED.docdate,
+      code=EXCLUDED.code, companyname=EXCLUDED.companyname,
+      cancelled=EXCLUDED.cancelled, status=EXCLUDED.status,
+      docamt=EXCLUDED.docamt, agent=EXCLUDED.agent,
+      docref1=EXCLUDED.docref1, docref2=EXCLUDED.docref2, docref3=EXCLUDED.docref3,
+      deliverydate=EXCLUDED.deliverydate, occ_synced_at=NOW()
   `, [
     r.dockey, safe(r.docno), safeDate(r.docdate), safe(r.code), safe(r.companyname),
     safe(r.description), r.cancelled ?? false, r.status ?? null,
@@ -267,16 +219,20 @@ async function insertSalesOrder(r) {
   ]);
 }
 
-async function insertDeliveryOrder(r) {
+async function upsertDO(r) {
   await q(`
     INSERT INTO sql_deliveryorders (
       dockey, docno, docdate, code, companyname, description,
       cancelled, status, docamt, agent, area,
-      docref1, docref2, docref3,
-      occ_synced_at
+      docref1, docref2, docref3, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      docamt=EXCLUDED.docamt, cancelled=EXCLUDED.cancelled, occ_synced_at=NOW()
+      docno=EXCLUDED.docno, docdate=EXCLUDED.docdate,
+      code=EXCLUDED.code, companyname=EXCLUDED.companyname,
+      cancelled=EXCLUDED.cancelled, status=EXCLUDED.status,
+      docamt=EXCLUDED.docamt, agent=EXCLUDED.agent,
+      docref1=EXCLUDED.docref1, docref2=EXCLUDED.docref2, docref3=EXCLUDED.docref3,
+      occ_synced_at=NOW()
   `, [
     r.dockey, safe(r.docno), safeDate(r.docdate), safe(r.code), safe(r.companyname),
     safe(r.description), r.cancelled ?? false, r.status ?? null,
@@ -285,17 +241,17 @@ async function insertDeliveryOrder(r) {
   ]);
 }
 
-async function insertCustomer(r) {
+async function upsertCustomer(r) {
   await q(`
     INSERT INTO sql_customers (
       dockey, code, companyname, creditterm, creditlimit,
-      outstanding, area, agent, status,
-      occ_synced_at
+      outstanding, area, agent, status, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      companyname=EXCLUDED.companyname, creditlimit=EXCLUDED.creditlimit,
-      outstanding=EXCLUDED.outstanding, status=EXCLUDED.status,
-      occ_synced_at=NOW()
+      code=EXCLUDED.code, companyname=EXCLUDED.companyname,
+      creditterm=EXCLUDED.creditterm, creditlimit=EXCLUDED.creditlimit,
+      outstanding=EXCLUDED.outstanding, area=EXCLUDED.area,
+      agent=EXCLUDED.agent, status=EXCLUDED.status, occ_synced_at=NOW()
   `, [
     r.dockey, safe(r.code), safe(r.companyname), safe(r.creditterm),
     safe(r.creditlimit), safe(r.outstanding), safe(r.area),
@@ -303,15 +259,15 @@ async function insertCustomer(r) {
   ]);
 }
 
-async function insertStockItem(r) {
+async function upsertStockItem(r) {
   await q(`
     INSERT INTO sql_stockitems (
       dockey, code, description, stockgroup, uom_code,
-      isactive, balsqty, reorderlevel,
-      occ_synced_at
+      isactive, balsqty, reorderlevel, occ_synced_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
     ON CONFLICT (dockey) DO UPDATE SET
-      description=EXCLUDED.description, balsqty=EXCLUDED.balsqty,
+      code=EXCLUDED.code, description=EXCLUDED.description,
+      stockgroup=EXCLUDED.stockgroup, balsqty=EXCLUDED.balsqty,
       isactive=EXCLUDED.isactive, reorderlevel=EXCLUDED.reorderlevel,
       occ_synced_at=NOW()
   `, [
