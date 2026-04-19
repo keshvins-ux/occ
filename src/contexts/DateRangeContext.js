@@ -17,8 +17,13 @@ function buildPresets() {
   const thisMonthName = monthNames[now.getMonth()];
   const lastMonthName = monthNames[(now.getMonth() + 11) % 12];
 
-  // Format as YYYY-MM-DD for the API
-  const fmtDate = (d) => d.toISOString().slice(0, 10);
+  // Format as YYYY-MM-DD using LOCAL date (not UTC — toISOString would shift dates in UTC+8)
+  const fmtDate = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
 
   return [
     { label: `This Month (${thisMonthName})`, days: dayOfMonth, key: "this_month", fromDate: fmtDate(thisMonthStart) },
