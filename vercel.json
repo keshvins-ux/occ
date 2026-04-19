@@ -5,7 +5,12 @@
     }
   },
   "crons": [
-    { "path": "/api/sync-v2", "schedule": "*/15 * * * *" },
-    { "path": "/api/sync-pilines", "schedule": "*/15 * * * *" }
+    { "path": "/api/sync-v2?table=salesinvoices", "schedule": "*/10 * * * *" },
+    { "path": "/api/sync-v2?table=receiptvouchers", "schedule": "2,12,22,32,42,52 * * * *" },
+    { "path": "/api/sync-v2?table=salesorders", "schedule": "4,14,24,34,44,54 * * * *" },
+    { "path": "/api/sync-v2?table=deliveryorders", "schedule": "6,16,26,36,46,56 * * * *" },
+    { "path": "/api/sync-v2?table=customers", "schedule": "0 */2 * * *" },
+    { "path": "/api/sync-v2?table=stockitems", "schedule": "30 */2 * * *" },
+    { "path": "/api/sync-pilines", "schedule": "8,18,28,38,48,58 * * * *" }
   ]
 }
