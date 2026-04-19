@@ -529,30 +529,47 @@ function parseDays(req, fallback = 90) {
   return Math.min(n, 730);
 }
 
+// Returns { sql, params } for date filtering
+// Uses exact fromDate when provided (calendar month precision)
+// Falls back to CURRENT_DATE - days when not
+function buildDateFilter(req, dateCol = 'docdate', paramOffset = 0) {
+  const from = req.query?.from; // YYYY-MM-DD
+  if (from && /^\d{4}-\d{2}-\d{2}$/.test(from)) {
+    return {
+      sql: `${dateCol}::date >= $${paramOffset + 1}::date`,
+      params: [from],
+      fromDate: from,
+    };
+  }
+  const days = parseDays(req);
+  return {
+    sql: `${dateCol}::date >= CURRENT_DATE - $${paramOffset + 1}::int`,
+    params: [days],
+    fromDate: null,
+  };
+}
+
 // Sales Overview — KPIs, 3-bucket trend, top customers, recent SOs, comparison summary
 async function handleOverview(req, res) {
   const days = parseDays(req);
+  const df = buildDateFilter(req);
+  // df.sql = "docdate::date >= $1::date" or "docdate::date >= CURRENT_DATE - $1::int"
+  // df.params = ["2026-04-01"] or [19]
 
   try {
     // KPIs over the window — invoiced from sql_salesinvoices
     const kpiRes = await q(
-      `
-      SELECT
-        COALESCE(SUM(docamt::numeric), 0) AS invoiced,
-        COUNT(*)::int AS invoice_count
-      FROM sql_salesinvoices
-      WHERE docdate >= CURRENT_DATE - $1::int
-        AND (cancelled = false OR cancelled IS NULL)
-      `,
-      [days]
+      `SELECT COALESCE(SUM(docamt::numeric), 0) AS invoiced, COUNT(*)::int AS invoice_count
+       FROM sql_salesinvoices
+       WHERE ${df.sql} AND (cancelled = false OR cancelled IS NULL)`,
+      df.params
     );
     // Collected from sql_receiptvouchers
     const colRes = await q(
       `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
        FROM sql_receiptvouchers
-       WHERE docdate >= CURRENT_DATE - $1::int
-         AND (cancelled = false OR cancelled IS NULL)`,
-      [days]
+       WHERE ${df.sql} AND (cancelled = false OR cancelled IS NULL)`,
+      df.params
     );
     const invoiced = Number(kpiRes.rows[0]?.invoiced || 0);
     const collected = Number(colRes.rows[0]?.collected || 0);
@@ -624,20 +641,15 @@ async function handleOverview(req, res) {
 
     // Top customers by revenue in the window
     const topRes = await q(
-      `
-      SELECT
-        i.code AS code,
-        i.companyname AS name,
-        SUM(i.docamt::numeric) AS revenue
-      FROM sql_salesinvoices i
-      WHERE i.docdate >= CURRENT_DATE - $1::int
-        AND (i.cancelled = false OR i.cancelled IS NULL)
-        AND i.code IS NOT NULL
-      GROUP BY i.code, i.companyname
-      ORDER BY revenue DESC
-      LIMIT 5
-      `,
-      [days]
+      `SELECT i.code AS code, i.companyname AS name, SUM(i.docamt::numeric) AS revenue
+       FROM sql_salesinvoices i
+       WHERE ${df.sql.replace('docdate', 'i.docdate')}
+         AND (i.cancelled = false OR i.cancelled IS NULL)
+         AND i.code IS NOT NULL
+       GROUP BY i.code, i.companyname
+       ORDER BY revenue DESC
+       LIMIT 5`,
+      df.params
     );
     const topCustomers = topRes.rows.map((r) => ({
       code: r.code,
@@ -743,6 +755,7 @@ function fmtRM(n) {
 // AR Overview
 async function handleAROverview(req, res) {
   const days = parseDays(req);
+  const df = buildDateFilter(req);
   try {
     // Total AR — from sql_customers (source of truth)
     const arRes = await q(
@@ -847,9 +860,9 @@ async function handleAROverview(req, res) {
     const collectedRes = await q(
       `SELECT COALESCE(SUM(docamt::numeric), 0) AS collected
        FROM sql_receiptvouchers
-       WHERE docdate >= CURRENT_DATE - $1::int
+       WHERE ${df.sql}
          AND (cancelled = false OR cancelled IS NULL)`,
-      [days]
+      df.params
     );
     const collected = Number(collectedRes.rows[0]?.collected || 0);
 
@@ -1022,6 +1035,7 @@ async function handlePipeline(req, res) {
 // Sales Analytics — agent performance + product mix
 async function handleAnalytics(req, res) {
   const days = parseDays(req);
+  const df = buildDateFilter(req, 'so.docdate');
   try {
     // Agent performance
     const agentRes = await q(
@@ -1031,12 +1045,12 @@ async function handleAnalytics(req, res) {
         COUNT(*)::int AS orders,
         SUM(so.docamt::numeric) AS revenue
       FROM sql_salesorders so
-      WHERE so.docdate >= CURRENT_DATE - $1::int
+      WHERE ${df.sql}
         AND so.cancelled = false
       GROUP BY COALESCE(so.agent, 'Unassigned')
       ORDER BY revenue DESC
       `,
-      [days]
+      df.params
     );
     const agents = agentRes.rows.map((r) => ({
       name: r.name,
@@ -1131,6 +1145,7 @@ async function handleAnalytics(req, res) {
 // Top Products — revenue from sales invoice lines, cost from purchase invoice lines, GP computed
 async function handleTopProducts(req, res) {
   const days = parseDays(req);
+  const df = buildDateFilter(req, 'si.docdate');
   try {
     // Revenue by product from sales invoice lines
     const revRes = await q(
@@ -1144,7 +1159,7 @@ async function handleTopProducts(req, res) {
         AVG(sol.unitprice::numeric) AS avg_sell_price
       FROM sql_inv_lines sol
       JOIN sql_salesinvoices si ON si.dockey = sol.dockey
-      WHERE si.docdate::date >= CURRENT_DATE - $1::int
+      WHERE ${df.sql}
         AND (si.cancelled = false OR si.cancelled IS NULL)
         AND sol.itemcode IS NOT NULL
       GROUP BY sol.itemcode
@@ -1158,6 +1173,7 @@ async function handleTopProducts(req, res) {
     let purchaseCosts = {};
     let hasCostData = false;
     try {
+      const piDf = buildDateFilter(req, 'pi.docdate');
       const costRes = await q(
         `
         SELECT
@@ -1167,12 +1183,12 @@ async function handleTopProducts(req, res) {
           AVG(pil.unitprice::numeric) AS avg_buy_price
         FROM sql_pi_lines pil
         JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
-        WHERE pi.docdate::date >= CURRENT_DATE - $1::int
+        WHERE ${piDf.sql}
           AND (pi.cancelled = false OR pi.cancelled IS NULL)
           AND pil.itemcode IS NOT NULL
         GROUP BY pil.itemcode
         `,
-        [days]
+        piDf.params
       );
       for (const r of costRes.rows) {
         purchaseCosts[r.code] = {
