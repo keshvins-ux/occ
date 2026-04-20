@@ -534,7 +534,18 @@ function parseDays(req, fallback = 90) {
 // Falls back to CURRENT_DATE - days when not
 function buildDateFilter(req, dateCol = 'docdate', paramOffset = 0) {
   const from = req.query?.from; // YYYY-MM-DD
+  const to = req.query?.to;     // YYYY-MM-DD (optional upper bound)
   if (from && /^\d{4}-\d{2}-\d{2}$/.test(from)) {
+    if (to && /^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      // Both from and to — bounded range (e.g. "Last Month March")
+      return {
+        sql: `${dateCol}::date >= $${paramOffset + 1}::date AND ${dateCol}::date <= $${paramOffset + 2}::date`,
+        params: [from, to],
+        fromDate: from,
+        toDate: to,
+      };
+    }
+    // Only from — open-ended (e.g. "This Month April" = April 1st onwards)
     return {
       sql: `${dateCol}::date >= $${paramOffset + 1}::date`,
       params: [from],
