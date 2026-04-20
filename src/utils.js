@@ -109,3 +109,12 @@ export async function fetchJson(url, opts = {}) {
   }
   return data;
 }
+
+// Build date query string from a DateRange preset
+// e.g. dateQs(range) → "&days=20&from=2026-04-01" or "&days=51&from=2026-03-01&to=2026-03-31"
+export function dateQs(range) {
+  let qs = `&days=${range.days}`;
+  if (range.fromDate) qs += `&from=${range.fromDate}`;
+  if (range.toDate) qs += `&to=${range.toDate}`;
+  return qs;
+}
