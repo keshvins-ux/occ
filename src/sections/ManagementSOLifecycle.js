@@ -7,7 +7,7 @@ import Pill from "../components/Pill";
 import WhatChanged from "../components/WhatChanged";
 import Ic from "../components/Ic";
 import { BRAND, COLORS, RADIUS, FONT, SHADOWS } from "../theme";
-import { fmt, fmt0, fmtD, fetchJson } from "../utils";
+import { fmt, fmt0, fmtD, fetchJson, dateQs } from "../utils";
 import { useDateRange } from "../contexts/DateRangeContext";
 
 export default function ManagementSOLifecycle() {
@@ -21,7 +21,7 @@ export default function ManagementSOLifecycle() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchJson(`/api/prospects?type=so_lifecycle&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
+    fetchJson(`/api/prospects?type=so_lifecycle${dateQs(range)}`)
       .then((resp) => !cancelled && setSOs(resp?.sos || []))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));

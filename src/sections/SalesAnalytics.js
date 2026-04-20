@@ -5,7 +5,7 @@ import Avatar from "../components/Avatar";
 import SortableTable from "../components/SortableTable";
 import Ic from "../components/Ic";
 import { BRAND, COLORS, RADIUS, FONT } from "../theme";
-import { fmt, fmt0, fetchJson } from "../utils";
+import { fmt, fmt0, fetchJson, dateQs } from "../utils";
 import { useDateRange } from "../contexts/DateRangeContext";
 
 export default function SalesAnalytics() {
@@ -17,7 +17,7 @@ export default function SalesAnalytics() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchJson(`/api/prospects?type=analytics&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
+    fetchJson(`/api/prospects?type=analytics${dateQs(range)}`)
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));

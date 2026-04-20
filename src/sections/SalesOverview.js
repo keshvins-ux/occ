@@ -8,7 +8,7 @@ import SortableTable from "../components/SortableTable";
 import WhatChanged from "../components/WhatChanged";
 import ComparisonPanel from "./ComparisonPanel";
 import { BRAND, COLORS, RADIUS, FONT } from "../theme";
-import { fmt, fmt0, fmtD, fetchJson } from "../utils";
+import { fmt, fmt0, fmtD, fetchJson, dateQs } from "../utils";
 import { useDateRange } from "../contexts/DateRangeContext";
 
 export default function SalesOverview() {
@@ -24,13 +24,13 @@ export default function SalesOverview() {
     let cancelled = false;
     setLoading(true);
     setError("");
-    fetchJson(`/api/prospects?type=overview&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
+    fetchJson(`/api/prospects?type=overview${dateQs(range)}`)
       .then((resp) => !cancelled && setData(resp))
       .catch((err) => !cancelled && setError(err.message || "Failed to load"))
       .finally(() => !cancelled && setLoading(false));
 
     setProductsLoading(true);
-    fetchJson(`/api/prospects?type=top_products&days=${range.days}${range.fromDate ? `&from=${range.fromDate}` : ''}`)
+    fetchJson(`/api/prospects?type=top_products${dateQs(range)}`)
       .then((resp) => !cancelled && setProductsData(resp))
       .catch(() => {})
       .finally(() => !cancelled && setProductsLoading(false));
