@@ -27,7 +27,7 @@ function buildPresets() {
 
   return [
     { label: `This Month (${thisMonthName})`, days: dayOfMonth, key: "this_month", fromDate: fmtDate(thisMonthStart) },
-    { label: `Last Month (${lastMonthName})`, days: dayOfMonth + new Date(now.getFullYear(), now.getMonth(), 0).getDate(), key: "last_month", fromDate: fmtDate(lastMonthStart) },
+    { label: `Last Month (${lastMonthName})`, days: dayOfMonth + new Date(now.getFullYear(), now.getMonth(), 0).getDate(), key: "last_month", fromDate: fmtDate(lastMonthStart), toDate: fmtDate(new Date(now.getFullYear(), now.getMonth(), 0)) },
     { label: "90 days", days: 90, key: "90" },
     { label: "180 days", days: 180, key: "180" },
     { label: "365 days", days: 365, key: "365" },
