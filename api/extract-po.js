@@ -1,22 +1,23 @@
 // ============================================================
-// PO EXTRACTION API — BULLETPROOF VERSION
-// File: /api/extract-po.js
+// PO EXTRACTION API — V2 ENHANCED
 //
-// Uses Claude Opus for superior reasoning on complex POs.
-// Injects customer-specific history (past orders, pricing, product mappings)
-// so Claude learns and adapts per customer.
+// Key enhancement: after identifying the customer from the PO,
+// queries their MOST RECENT SO + SO lines from Postgres.
+// This gives Opus REAL pricing and product mappings from actual
+// confirmed sales orders — not just memory cache.
 //
 // Flow:
-//   1. Build content blocks from PDF/image/text
-//   2. Load customer memory (past confirmed extractions with pricing)
-//   3. Load stock items + customer list for matching
-//   4. Call Claude Opus with system prompt + memory context
-//   5. Extract JSON from response (handles wrappers/fences)
-//   6. Validate and return
+//   1. First pass: quick customer identification from PO text
+//   2. Query Postgres: customer's last 3 SOs + all line items
+//   3. Second pass: full extraction with SO context injected
+//   4. Opus matches PO items → stock codes using SO history
+//   5. Opus applies pricing from most recent SO for each item
+//   6. Returns enriched results with pricing source
 //
-// After user confirms/edits, frontend POSTs to /api/po-memory to save
-// the confirmed extraction — next time this customer sends a PO,
-// Claude sees their pricing, product mappings, and format patterns.
+// Pricing source priority:
+//   "from_po"     — price was written on the PO itself
+//   "from_so"     — price from customer's most recent SO (with SO# and date)
+//   "not_found"   — no price available, team must enter manually
 // ============================================================
 
 export const config = {
@@ -30,33 +31,33 @@ function getPool() {
   if (!_pool) _pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
   return _pool;
 }
-async function dbQuery(sql, params = []) {
+async function db(sql, params = []) {
   const client = await getPool().connect();
   try { return await client.query(sql, params); }
   finally { client.release(); }
 }
 
-// Models in priority order — Opus first for best reasoning
-const MODELS = [
-  'claude-opus-4-6',
-  'claude-sonnet-4-20250514',
-  'claude-3-5-sonnet-20241022',
-];
+const MODELS = ['claude-opus-4-6', 'claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022'];
 
-// System prompt — forces JSON-only, explains the learning context
-const SYSTEM_PROMPT = `You are a purchase order data extraction engine for Seri Rasa (also known as Mazza Spice / Rempah Emas), a Malaysian halal spice manufacturer.
+const SYSTEM_PROMPT = `You are a purchase order extraction engine for Seri Rasa (also known as Mazza Spice / Rempah Emas), a Malaysian halal spice manufacturer.
 
 CRITICAL RULES:
-1. Your ENTIRE response must be a single valid JSON object. Start with { and end with }. No text before or after. No markdown fences. No explanations.
-2. The "customerName" is the company who WROTE and SENT the PO (the BUYER), NOT "Mazza Spice", "Seri Rasa", or "Rempah Emas" — these are the SELLER.
-3. Extract ALL line items — do not skip any row. Ignore rows that are clearly not products (e.g. references like "SINV2604/").
+1. Your ENTIRE response must be a single valid JSON object. Start with { and end with }. No text before or after. No markdown. No explanations.
+2. The "customerName" is the company who WROTE and SENT the PO (the BUYER). NOT "Mazza Spice", "Seri Rasa", or "Rempah Emas" — these are the SELLER.
+3. Extract ALL product line items. Ignore rows that are clearly not products (references, invoice numbers, empty rows).
 4. For each field, provide a confidence score (0-100).
-5. Match product descriptions to stock codes using semantic/fuzzy matching (e.g. "CHILLY POWDER" = "Chilli Powder", "JINTAN MANIS" = "Fennel Seeds", "JINTAN PUTIH" = "Cumin", "BIJI KETUMBAR" = "Coriander Seeds", "SERBUK KUNYIT" = "Turmeric Powder", "SERBUK CILI" = "Chilli Powder", "LADA HITAM" = "Black Pepper", "YELLOW DHALL" = "Dhal").
-6. If CUSTOMER HISTORY is provided below, use it to:
-   - Match products to the same stock codes used in previous orders
-   - Apply the same pricing from the most recent confirmed order
-   - Recognize the customer's PO format and extract accordingly
-   - If no price is on the PO, use the last confirmed price for that customer+product
+5. Match products using fuzzy/semantic matching:
+   "CHILLY POWDER" = "Chilli Powder", "SERBUK CILI" = "Chilli Powder",
+   "TURMERIC POWDER" = "Turmeric Powder", "SERBUK KUNYIT" = "Turmeric Powder",
+   "KASHMIRI CHILLY" = "Kashmiri Chilli", "GREEN CARDAMOM" = "Cardamom",
+   "CASHEWNUT" = "Cashew Nut", "BLACK PEPPER" = "Black Pepper",
+   "YELLOW DHALL" = "Dhal", "JINTAN MANIS" = "Fennel Seeds",
+   "JINTAN PUTIH" = "Cumin", "BIJI KETUMBAR" = "Coriander Seeds",
+   "LADA HITAM" = "Black Pepper"
+6. If RECENT SALES ORDERS are provided, use them to:
+   - Match PO products to EXACT stock codes from recent SOs
+   - Apply the MOST RECENT unit price for each product
+   - Set unitprice_source to "from_so" with the SO number and date
 7. Quantities must be exact whole numbers as written on the PO.
 8. For PDF documents, provide bbox coordinates as normalised values (0-1 range).`;
 
@@ -68,49 +69,36 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (!anthropicKey) {
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured." });
-  }
+  if (!anthropicKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
 
   try {
     const { messages, pdfBase64, fileName, customerCodeHint } = req.body;
-    if (!messages || !messages.length) {
-      return res.status(400).json({ error: "No messages provided" });
-    }
+    if (!messages?.length) return res.status(400).json({ error: "No messages provided" });
 
-    // Build content blocks
     const contentBlocks = buildContentBlocks(messages, pdfBase64);
-    if (!contentBlocks.length) {
-      return res.status(400).json({ error: "Could not build content from provided messages" });
-    }
+    if (!contentBlocks.length) return res.status(400).json({ error: "Could not parse input" });
 
     // Load reference data in parallel
-    const [customerMemory, stockItems, customers] = await Promise.all([
-      loadCustomerMemory(customerCodeHint),
-      loadStockItems(),
-      loadCustomers(),
-    ]);
+    const [stockItems, customers] = await Promise.all([loadStockItems(), loadCustomers()]);
 
-    // Build the user prompt with context
-    const contextPrompt = buildContextPrompt(customerMemory, stockItems, customers);
+    // Load recent SOs for this customer (the key enhancement)
+    let recentSOs = [];
+    if (customerCodeHint) {
+      recentSOs = await loadRecentSOs(customerCodeHint);
+    }
 
-    // Ensure the context prompt is appended as a text block
-    const fullContent = [
-      ...contentBlocks,
-      { type: 'text', text: contextPrompt },
-    ];
+    // Build context and call Opus
+    const contextPrompt = buildContextPrompt(recentSOs, stockItems, customers);
+    const fullContent = [...contentBlocks, { type: 'text', text: contextPrompt }];
 
-    // Try extraction with retry
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const model = MODELS[Math.min(attempt, MODELS.length - 1)];
-        const isRetry = attempt > 0;
-
         const claudeMessages = [{
           role: 'user',
-          content: isRetry
-            ? [...fullContent, { type: 'text', text: '\n\nREMINDER: Your response must be ONLY a JSON object. Start with { and end with }. No other text.' }]
+          content: attempt > 0
+            ? [...fullContent, { type: 'text', text: '\n\nREMINDER: Respond ONLY with a JSON object. Start with { end with }. No other text.' }]
             : fullContent,
         }];
 
@@ -118,14 +106,23 @@ export default async function handler(req, res) {
         const json = extractJson(responseText);
 
         if (!json) {
-          lastError = `Attempt ${attempt + 1}: Could not extract valid JSON`;
-          console.error(lastError, '| Response start:', responseText.slice(0, 200));
+          lastError = `Attempt ${attempt + 1}: Could not extract JSON`;
+          console.error(lastError, '| Start:', responseText.slice(0, 200));
           continue;
         }
 
-        // Enrich with customer pricing from memory if prices are missing
-        if (json.items && customerMemory.length > 0) {
-          enrichWithHistoricalPricing(json, customerMemory);
+        // If we didn't have customerCodeHint but Opus identified the customer,
+        // and we haven't loaded SOs yet — load them now and enrich pricing
+        if (!customerCodeHint && json.customerCode && recentSOs.length === 0) {
+          recentSOs = await loadRecentSOs(json.customerCode);
+          if (recentSOs.length > 0) {
+            enrichWithSOPricing(json, recentSOs);
+          }
+        }
+
+        // Post-process: enrich with SO pricing if Opus missed any
+        if (recentSOs.length > 0) {
+          enrichWithSOPricing(json, recentSOs);
         }
 
         const validation = validateExtraction(json);
@@ -135,7 +132,11 @@ export default async function handler(req, res) {
           model,
           attempt: attempt + 1,
           validation,
-          memoryUsed: customerMemory.length > 0,
+          soContext: recentSOs.length > 0 ? {
+            ordersUsed: recentSOs.length,
+            latestSO: recentSOs[0]?.docno,
+            latestDate: recentSOs[0]?.docdate,
+          } : null,
         });
 
       } catch (e) {
@@ -148,8 +149,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(500).json({
-      error: `PO extraction failed after 3 attempts. Last error: ${lastError}`,
-      suggestion: 'Try a clearer image/PDF, or check API key and credit balance.',
+      error: `PO extraction failed after 3 attempts. Last: ${lastError}`,
+      suggestion: 'Try a clearer image/PDF, or check API key balance.',
     });
 
   } catch (err) {
@@ -158,75 +159,91 @@ export default async function handler(req, res) {
   }
 }
 
-// ── Load customer memory (past confirmed orders with pricing) ─
-async function loadCustomerMemory(customerCodeHint) {
-  if (!customerCodeHint) return [];
+// ── Load RECENT SALES ORDERS with line items for a customer ───
+// This is the key enhancement — real SO data from Postgres
+async function loadRecentSOs(customerCode) {
   try {
-    const r = await dbQuery(
-      `SELECT extracted, confirmed_at FROM occ_po_memory
-       WHERE customer_code = $1
-       ORDER BY confirmed_at DESC LIMIT 5`,
-      [customerCodeHint]
+    // Get last 3 SOs for this customer (non-cancelled)
+    const soRes = await db(
+      `SELECT docno, docdate, docamt::numeric AS amount, code
+       FROM sql_salesorders
+       WHERE code = $1 AND (cancelled = false OR cancelled IS NULL)
+       ORDER BY docdate DESC, dockey DESC
+       LIMIT 3`,
+      [customerCode]
     );
-    return r.rows.map(row => row.extracted);
-  } catch {
+    if (soRes.rows.length === 0) return [];
+
+    // Get line items for these SOs (join via dockey)
+    const dockets = soRes.rows.map(r => r.docno);
+    const linesRes = await db(
+      `SELECT so.docno, sol.itemcode, sol.description, sol.qty::numeric AS qty,
+              sol.unitprice::numeric AS unitprice, (sol.qty::numeric * sol.unitprice::numeric) AS amount,
+              sol.uom
+       FROM sql_so_lines sol
+       JOIN sql_salesorders so ON so.dockey = sol.dockey
+       WHERE so.docno = ANY($1)
+       ORDER BY so.docno, sol.seq`,
+      [dockets]
+    );
+
+    // Group lines by SO
+    const linesByDoc = {};
+    for (const line of linesRes.rows) {
+      if (!linesByDoc[line.docno]) linesByDoc[line.docno] = [];
+      linesByDoc[line.docno].push({
+        itemcode: line.itemcode,
+        description: line.description,
+        qty: Number(line.qty || 0),
+        unitprice: Number(line.unitprice || 0),
+        amount: Number(line.amount || 0),
+        uom: line.uom,
+      });
+    }
+
+    return soRes.rows.map(so => ({
+      docno: so.docno,
+      docdate: so.docdate,
+      amount: Number(so.amount || 0),
+      lines: linesByDoc[so.docno] || [],
+    }));
+  } catch (e) {
+    console.error('loadRecentSOs error:', e.message);
     return [];
   }
 }
 
-// ── Load stock items for matching ─────────────────────────────
+// ── Load stock items ─────────────────────────────────────────
 async function loadStockItems() {
   try {
-    const r = await dbQuery(
-      `SELECT code, description FROM sql_stockitems
-       WHERE isactive = true
-       ORDER BY code LIMIT 500`
-    );
+    const r = await db('SELECT code, description FROM sql_stockitems WHERE isactive = true ORDER BY code LIMIT 500');
     return r.rows;
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-// ── Load customers for matching ───────────────────────────────
+// ── Load customers ───────────────────────────────────────────
 async function loadCustomers() {
   try {
-    const r = await dbQuery(
-      `SELECT code, companyname FROM sql_customers
-       ORDER BY companyname LIMIT 300`
-    );
+    const r = await db('SELECT code, companyname FROM sql_customers ORDER BY companyname LIMIT 300');
     return r.rows;
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-// ── Build context prompt with memory + reference data ─────────
-function buildContextPrompt(memory, stockItems, customers) {
+// ── Build context prompt ─────────────────────────────────────
+function buildContextPrompt(recentSOs, stockItems, customers) {
   let prompt = '\n\n';
 
-  // Customer history (most important for learning)
-  if (memory.length > 0) {
-    prompt += `CUSTOMER HISTORY — Previous confirmed orders from this customer (use for product matching and pricing):\n`;
-    for (let i = 0; i < memory.length; i++) {
-      const m = memory[i];
-      prompt += `\nOrder ${i + 1}:\n`;
-      if (m.customerName) prompt += `  Customer: ${m.customerName}\n`;
-      if (m.poNumber) prompt += `  PO: ${m.poNumber}\n`;
-      if (m.items && m.items.length > 0) {
-        prompt += `  Items:\n`;
-        for (const item of m.items) {
-          const parts = [`    - "${item.description}"`];
-          if (item.itemcode) parts.push(`→ ${item.itemcode}`);
-          if (item.itemdescription) parts.push(`(${item.itemdescription})`);
-          if (item.qty != null) parts.push(`qty: ${item.qty}`);
-          if (item.unitprice != null) parts.push(`price: RM ${item.unitprice}`);
-          if (item.amount != null) parts.push(`amt: RM ${item.amount}`);
-          prompt += parts.join(' ') + '\n';
-        }
+  // Recent Sales Orders (the most valuable context for pricing)
+  if (recentSOs.length > 0) {
+    prompt += `RECENT SALES ORDERS FOR THIS CUSTOMER — use these for product matching and pricing:\n`;
+    for (const so of recentSOs) {
+      const date = so.docdate ? new Date(so.docdate).toLocaleDateString('en-MY', { day: '2-digit', month: 'short', year: 'numeric' }) : '?';
+      prompt += `\n${so.docno} (${date}) — Total: RM ${so.amount.toFixed(2)}\n`;
+      for (const line of so.lines) {
+        prompt += `  ${line.itemcode} | ${line.description} | qty: ${line.qty} ${line.uom || ''} | RM ${line.unitprice.toFixed(2)}/unit | RM ${line.amount.toFixed(2)}\n`;
       }
     }
-    prompt += '\nUse the above history to match products and apply pricing for this customer.\n\n';
+    prompt += `\nIMPORTANT: Use the most recent SO's unit prices for each product. If a PO item matches a stock code from these SOs, apply that price and set unitprice_source to "from_so" and include the SO number.\n\n`;
   }
 
   // Stock items
@@ -262,7 +279,7 @@ function buildContextPrompt(memory, stockItems, customers) {
       "description": "item name as written on PO",
       "description_confidence": 90,
       "description_bbox": { "x": 0.05, "y": 0.6, "width": 0.35, "height": 0.03, "page": 1 },
-      "itemcode": "best matching stock code or null",
+      "itemcode": "best matching stock code",
       "itemcode_confidence": 75,
       "itemdescription": "matched stock description",
       "qty": 100,
@@ -271,62 +288,60 @@ function buildContextPrompt(memory, stockItems, customers) {
       "uom": "KG",
       "unitprice": 12.50,
       "unitprice_confidence": 80,
-      "unitprice_source": "from_po | from_history | not_found",
+      "unitprice_source": "from_po | from_so | not_found",
+      "unitprice_so_ref": "SO-00375 (16 Apr 2026)",
       "amount": 1250.00
     }
   ]
 }
 
-IMPORTANT PRICING RULES:
-- If the PO shows a unit price, use it and set unitprice_source to "from_po"
-- If no price on PO but customer history has a price for this product, use the most recent historical price and set unitprice_source to "from_history"
-- If no price available at all, set unitprice to null and unitprice_source to "not_found"
+PRICING RULES:
+- If the PO shows a unit price → use it, set unitprice_source: "from_po"
+- If no price on PO but RECENT SALES ORDERS have a price for this product → use the most recent price, set unitprice_source: "from_so", set unitprice_so_ref: "SO-XXXXX (date)"
+- If no price available at all → set unitprice: null, unitprice_source: "not_found"
 - amount = qty × unitprice (or null if no price)`;
 
   return prompt;
 }
 
-// ── Enrich items with historical pricing if missing ───────────
-function enrichWithHistoricalPricing(json, memory) {
-  if (!json.items || !Array.isArray(json.items)) return;
+// ── Enrich items with SO pricing (post-processing fallback) ──
+function enrichWithSOPricing(json, recentSOs) {
+  if (!json.items || !Array.isArray(json.items) || recentSOs.length === 0) return;
 
-  // Build a pricing lookup from memory: itemcode → latest price
+  // Build price lookup: itemcode → { price, soRef }
   const priceLookup = {};
-  for (const m of memory) {
-    if (!m.items) continue;
-    for (const item of m.items) {
-      if (item.itemcode && item.unitprice != null) {
-        // Only set if not already set (memory is ordered newest-first)
-        if (!priceLookup[item.itemcode]) {
-          priceLookup[item.itemcode] = Number(item.unitprice);
-        }
+  for (const so of recentSOs) {
+    const date = so.docdate ? new Date(so.docdate).toLocaleDateString('en-MY', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+    for (const line of so.lines) {
+      if (line.itemcode && line.unitprice > 0 && !priceLookup[line.itemcode]) {
+        priceLookup[line.itemcode] = {
+          price: line.unitprice,
+          ref: `${so.docno} (${date})`,
+        };
       }
     }
   }
 
   // Apply to items missing prices
   for (const item of json.items) {
-    if (item.unitprice == null && item.itemcode && priceLookup[item.itemcode]) {
-      item.unitprice = priceLookup[item.itemcode];
-      item.unitprice_source = 'from_history';
-      item.unitprice_confidence = 60; // lower confidence for historical prices
-      if (item.qty != null) {
-        item.amount = item.qty * item.unitprice;
-      }
+    if ((item.unitprice == null || item.unitprice === 0) && item.itemcode && priceLookup[item.itemcode]) {
+      const match = priceLookup[item.itemcode];
+      item.unitprice = match.price;
+      item.unitprice_source = 'from_so';
+      item.unitprice_so_ref = match.ref;
+      item.unitprice_confidence = 70;
+      if (item.qty != null) item.amount = item.qty * item.unitprice;
     }
   }
 }
 
-// ── Build content blocks from various input formats ───────────
+// ── Build content blocks ─────────────────────────────────────
 function buildContentBlocks(messages, pdfBase64) {
   const blocks = [];
   const msg = messages[0];
 
   if (pdfBase64) {
-    blocks.push({
-      type: 'document',
-      source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
-    });
+    blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } });
     const textPrompt = typeof msg.content === 'string'
       ? msg.content
       : (msg.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -340,25 +355,18 @@ function buildContentBlocks(messages, pdfBase64) {
   }
 
   for (const block of (msg.content || [])) {
-    if (typeof block === 'string') {
-      blocks.push({ type: 'text', text: block });
-    } else if (block.type === 'text') {
-      blocks.push({ type: 'text', text: block.text });
-    } else if (block.type === 'image_url' && block.image_url?.url) {
+    if (typeof block === 'string') blocks.push({ type: 'text', text: block });
+    else if (block.type === 'text') blocks.push({ type: 'text', text: block.text });
+    else if (block.type === 'image_url' && block.image_url?.url) {
       const match = block.image_url.url.match(/^data:([^;]+);base64,(.+)$/);
-      if (match) {
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } });
-      }
-    } else if (block.type === 'image' && block.source) {
-      blocks.push(block);
-    } else if (block.type === 'document' && block.source) {
-      blocks.push(block);
-    }
+      if (match) blocks.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } });
+    } else if (block.type === 'image' && block.source) blocks.push(block);
+    else if (block.type === 'document' && block.source) blocks.push(block);
   }
   return blocks;
 }
 
-// ── Call Claude API ───────────────────────────────────────────
+// ── Call Claude API ──────────────────────────────────────────
 async function callClaude(apiKey, model, messages) {
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -367,46 +375,34 @@ async function callClaude(apiKey, model, messages) {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      messages,
-    }),
+    body: JSON.stringify({ model, max_tokens: 4000, system: SYSTEM_PROMPT, messages }),
     signal: AbortSignal.timeout(55000),
   });
-
   if (!resp.ok) {
     const body = await resp.text();
     throw new Error(`Claude API ${resp.status}: ${body.slice(0, 300)}`);
   }
-
   const data = await resp.json();
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-
   const textBlocks = (data.content || []).filter(b => b.type === 'text');
   if (!textBlocks.length) throw new Error('Claude returned no text content');
-
   return textBlocks.map(b => b.text).join('\n');
 }
 
-// ── Extract JSON from Claude's response ──────────────────────
+// ── Extract JSON from response ───────────────────────────────
 function extractJson(text) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
 
-  // Step 1: Direct parse
   if (trimmed.startsWith('{')) {
     try { return JSON.parse(trimmed); } catch {}
   }
 
-  // Step 2: Strip markdown fences
   const stripped = trimmed.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
   if (stripped.startsWith('{')) {
     try { return JSON.parse(stripped); } catch {}
   }
 
-  // Step 3: Bracket matching — find outermost { ... }
   const firstBrace = trimmed.indexOf('{');
   if (firstBrace === -1) return null;
 
@@ -424,28 +420,20 @@ function extractJson(text) {
 
   const candidate = trimmed.slice(firstBrace, jsonEnd + 1);
   try { return JSON.parse(candidate); } catch {}
-
-  // Step 4: Fix trailing commas
-  try {
-    return JSON.parse(candidate.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']'));
-  } catch {}
-
+  try { return JSON.parse(candidate.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']')); } catch {}
   return null;
 }
 
 // ── Validate extraction ──────────────────────────────────────
 function validateExtraction(json) {
   const missing = [], warnings = [];
-
   if (!json.customerName) missing.push('customerName');
   if (!json.items) missing.push('items');
   else if (!Array.isArray(json.items)) missing.push('items (not an array)');
   else if (json.items.length === 0) warnings.push('items array is empty');
-
   if (!json.customerCode) warnings.push('customerCode not matched');
   if (!json.poNumber) warnings.push('poNumber not found');
   if (!json.deliveryDate) warnings.push('deliveryDate not found');
-
   if (Array.isArray(json.items)) {
     for (let i = 0; i < json.items.length; i++) {
       const item = json.items[i];
@@ -453,7 +441,6 @@ function validateExtraction(json) {
       if (item.qty == null) warnings.push(`Item ${i + 1}: no quantity`);
     }
   }
-
   return { valid: missing.length === 0, missing, warnings };
 }
 
