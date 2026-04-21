@@ -1001,12 +1001,19 @@ async function handleSOLifecycle(req, res) {
       else if (String(row.docref3 || '').toUpperCase().trim() === 'DONE') status = 'complete';
       else if (Number(row.delivered_qty) > 0 && Number(row.delivered_qty) < Number(row.total_qty))
         status = 'partial';
+
+      // Sanity check: if delivery date is before SO date, it's a data entry error — ignore it
+      let deliveryDate = row.delivery_date;
+      if (deliveryDate && row.date && new Date(deliveryDate) < new Date(row.date)) {
+        deliveryDate = null; // treat as no delivery date
+      }
+
       return {
         docno: row.docno,
         date: row.date,
         customer: row.customer,
         amount: Number(row.amount || 0),
-        deliveryDate: row.delivery_date,
+        deliveryDate,
         status,
       };
     });
@@ -1043,107 +1050,189 @@ async function handlePipeline(req, res) {
   }
 }
 
-// Sales Analytics — agent performance + product mix
+// Sales Analytics — agent performance + product mix + margins
 async function handleAnalytics(req, res) {
   const days = parseDays(req);
   const df = buildDateFilter(req, 'so.docdate');
+  const from = req.query?.from;
+  const to = req.query?.to;
+
+  // Build consistent date SQL for queries that don't use buildDateFilter
+  // These need to work with BOTH days-based and from-based filtering
+  let periodSql, periodParams;
+  if (from && /^\d{4}-\d{2}-\d{2}$/.test(from)) {
+    if (to && /^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      periodSql = `docdate::date >= $1::date AND docdate::date <= $2::date`;
+      periodParams = [from, to];
+    } else {
+      periodSql = `docdate::date >= $1::date`;
+      periodParams = [from];
+    }
+  } else {
+    periodSql = `docdate::date >= CURRENT_DATE - $1::int`;
+    periodParams = [days];
+  }
+
   try {
-    // Agent performance
+    // Agent performance — uses buildDateFilter for SO-based query
     const agentRes = await q(
-      `
-      SELECT
-        COALESCE(so.agent, 'Unassigned') AS name,
-        COUNT(*)::int AS orders,
-        SUM(so.docamt::numeric) AS revenue
-      FROM sql_salesorders so
-      WHERE ${df.sql}
-        AND so.cancelled = false
-      GROUP BY COALESCE(so.agent, 'Unassigned')
-      ORDER BY revenue DESC
-      `,
-      df.params
+      `SELECT COALESCE(so.agent, 'Unassigned') AS name, COUNT(*)::int AS orders, SUM(so.docamt::numeric) AS revenue
+       FROM sql_salesorders so WHERE ${df.sql} AND so.cancelled = false
+       GROUP BY COALESCE(so.agent, 'Unassigned') ORDER BY revenue DESC`, df.params
     );
-    const agents = agentRes.rows.map((r) => ({
-      name: r.name,
-      orders: Number(r.orders || 0),
-      revenue: Number(r.revenue || 0),
-    }));
+    const agents = agentRes.rows.map((r) => ({ name: r.name, orders: Number(r.orders || 0), revenue: Number(r.revenue || 0) }));
 
-    // Product mix — top products by revenue
+    // Product mix with MARGIN DATA — selling from inv_lines, cost from pi_lines
+    const invDf = buildDateFilter(req, 'si.docdate');
     const productRes = await q(
-      `
-      SELECT
-        sol.itemcode AS code,
-        COALESCE(MAX(sol.description), sol.itemcode) AS name,
-        SUM(sol.qty::numeric) AS qty,
-        SUM(sol.amount::numeric) AS revenue
-      FROM sql_so_lines sol
-      JOIN sql_salesorders so ON so.dockey = sol.dockey
-      WHERE so.docdate >= CURRENT_DATE - $1::int
-        AND so.cancelled = false
-        AND sol.itemcode IS NOT NULL
-      GROUP BY sol.itemcode
-      ORDER BY revenue DESC
-      LIMIT 20
-      `,
-      [days]
+      `SELECT sol.itemcode AS code, COALESCE(MAX(sol.description), sol.itemcode) AS name,
+              SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+       FROM sql_inv_lines sol JOIN sql_salesinvoices si ON si.dockey = sol.dockey
+       WHERE ${invDf.sql} AND (si.cancelled = false OR si.cancelled IS NULL) AND sol.itemcode IS NOT NULL
+       GROUP BY sol.itemcode ORDER BY revenue DESC LIMIT 20`, invDf.params
     );
-    const products = productRes.rows.map((r) => ({
-      code: r.code,
-      name: r.name,
-      qty: Number(r.qty || 0),
-      revenue: Number(r.revenue || 0),
-    }));
 
-    // Growth — compare current period invoiced vs previous equal period
-    const growthRes = await q(
-      `
-      SELECT
-        COALESCE(SUM(CASE WHEN docdate >= CURRENT_DATE - $1::int THEN docamt::numeric ELSE 0 END), 0) AS current,
-        COALESCE(SUM(CASE WHEN docdate >= CURRENT_DATE - ($1::int * 2)
-                           AND docdate <  CURRENT_DATE - $1::int
-                          THEN docamt::numeric ELSE 0 END), 0) AS previous
-      FROM sql_salesinvoices
-      WHERE (cancelled = false OR cancelled IS NULL)
-      `,
-      [days]
-    );
-    const currentRev = Number(growthRes.rows[0]?.current || 0);
-    const previousRev = Number(growthRes.rows[0]?.previous || 0);
+    // Get purchase costs per item (average cost from purchase invoice lines)
+    let costLookup = {};
+    try {
+      const costRes = await q(
+        `SELECT itemcode, AVG(unitprice::numeric) AS avg_cost
+         FROM sql_pi_lines
+         WHERE itemcode IS NOT NULL AND unitprice IS NOT NULL
+         GROUP BY itemcode`
+      );
+      for (const r of costRes.rows) {
+        costLookup[r.itemcode] = Number(r.avg_cost || 0);
+      }
+    } catch {} // sql_pi_lines may not exist yet
+
+    const products = productRes.rows.map((r) => {
+      const revenue = Number(r.revenue || 0);
+      const qty = Number(r.qty || 0);
+      const sellingPrice = qty > 0 ? revenue / qty : 0;
+      const costPrice = costLookup[r.code] || 0;
+      const marginValue = costPrice > 0 ? (sellingPrice - costPrice) * qty : 0;
+      const marginPct = costPrice > 0 && sellingPrice > 0 ? ((sellingPrice - costPrice) / sellingPrice * 100) : null;
+      return {
+        code: r.code, name: r.name, qty, revenue,
+        sellingPrice: Math.round(sellingPrice * 100) / 100,
+        costPrice: Math.round(costPrice * 100) / 100,
+        marginValue: Math.round(marginValue * 100) / 100,
+        marginPct: marginPct != null ? Math.round(marginPct * 10) / 10 : null,
+      };
+    });
+
+    // Growth — current period vs same-length previous period
+    let currentRev = 0, previousRev = 0;
+    try {
+      if (from) {
+        // From-based: current = from..to, previous = same length before from
+        const fromDate = new Date(from);
+        const toDate = to ? new Date(to) : new Date();
+        const periodDays = Math.ceil((toDate - fromDate) / 86400000);
+        const prevFrom = new Date(fromDate);
+        prevFrom.setDate(prevFrom.getDate() - periodDays);
+        const fmtD = d => d.toISOString().slice(0, 10);
+
+        const growthRes = await q(
+          `SELECT
+            COALESCE(SUM(CASE WHEN docdate::date >= $1::date AND docdate::date <= $2::date THEN docamt::numeric ELSE 0 END), 0) AS current,
+            COALESCE(SUM(CASE WHEN docdate::date >= $3::date AND docdate::date < $1::date THEN docamt::numeric ELSE 0 END), 0) AS previous
+           FROM sql_salesinvoices WHERE (cancelled = false OR cancelled IS NULL)`,
+          [from, to || new Date().toISOString().slice(0, 10), fmtD(prevFrom)]
+        );
+        currentRev = Number(growthRes.rows[0]?.current || 0);
+        previousRev = Number(growthRes.rows[0]?.previous || 0);
+      } else {
+        const growthRes = await q(
+          `SELECT
+            COALESCE(SUM(CASE WHEN docdate >= CURRENT_DATE - $1::int THEN docamt::numeric ELSE 0 END), 0) AS current,
+            COALESCE(SUM(CASE WHEN docdate >= CURRENT_DATE - ($1::int * 2) AND docdate < CURRENT_DATE - $1::int THEN docamt::numeric ELSE 0 END), 0) AS previous
+           FROM sql_salesinvoices WHERE (cancelled = false OR cancelled IS NULL)`, [days]
+        );
+        currentRev = Number(growthRes.rows[0]?.current || 0);
+        previousRev = Number(growthRes.rows[0]?.previous || 0);
+      }
+    } catch (e) { console.error('growth query error:', e.message); }
+
     const growthPct = previousRev > 0 ? (((currentRev - previousRev) / previousRev) * 100).toFixed(1) : null;
 
-    // Customer concentration — share of revenue from top 5 customers
-    const concRes = await q(
-      `
-      WITH rev AS (
-        SELECT i.code, SUM(i.docamt::numeric) AS r
-        FROM sql_salesinvoices i
-        WHERE i.docdate >= CURRENT_DATE - $1::int
-          AND (i.cancelled = false OR i.cancelled IS NULL)
-          AND i.code IS NOT NULL
-        GROUP BY i.code
-      ),
-      totals AS (
-        SELECT SUM(r) AS total, SUM(r) FILTER (WHERE r > 0) AS nz FROM rev
-      )
-      SELECT
-        COALESCE(SUM(top5.r), 0) AS top5,
-        COALESCE((SELECT total FROM totals), 0) AS total
-      FROM (SELECT r FROM rev ORDER BY r DESC LIMIT 5) top5
-      `,
-      [days]
-    );
-    const top5 = Number(concRes.rows[0]?.top5 || 0);
-    const totalRev = Number(concRes.rows[0]?.total || 0);
-    const topCustomerShare = totalRev > 0 ? Math.round((top5 / totalRev) * 100) : 0;
+    // Customer concentration — top 5 share
+    let topCustomerShare = 0, topCustomers = [];
+    try {
+      const concRes = await q(
+        `WITH rev AS (
+          SELECT i.code, i.companyname AS name, SUM(i.docamt::numeric) AS r FROM sql_salesinvoices i
+          WHERE ${periodSql.replace(/docdate/g, 'i.docdate')} AND (i.cancelled = false OR i.cancelled IS NULL) AND i.code IS NOT NULL
+          GROUP BY i.code, i.companyname
+        ), totals AS (SELECT SUM(r) AS total FROM rev)
+        SELECT code, name, r AS revenue, COALESCE((SELECT total FROM totals), 0) AS total
+        FROM rev ORDER BY r DESC LIMIT 5`,
+        periodParams
+      );
+      topCustomers = concRes.rows.map(r => ({ code: r.code, name: r.name, revenue: Number(r.revenue || 0) }));
+      const totalRev = Number(concRes.rows[0]?.total || 0);
+      const top5Rev = topCustomers.reduce((s, c) => s + c.revenue, 0);
+      topCustomerShare = totalRev > 0 ? Math.round((top5Rev / totalRev) * 100) : 0;
+    } catch (e) { console.error('concentration query error:', e.message); }
+
+    // Monthly revenue trend (last 6 months — always uses fixed lookback)
+    let monthlyTrend = [];
+    try {
+      const trendRes = await q(
+        `SELECT TO_CHAR(DATE_TRUNC('month', docdate::date), 'Mon') AS label,
+                DATE_TRUNC('month', docdate::date) AS month,
+                SUM(docamt::numeric) AS invoiced
+         FROM sql_salesinvoices
+         WHERE docdate >= CURRENT_DATE - INTERVAL '6 months' AND (cancelled = false OR cancelled IS NULL)
+         GROUP BY DATE_TRUNC('month', docdate::date)
+         ORDER BY month`
+      );
+      monthlyTrend = trendRes.rows.map(r => ({ label: r.label?.trim(), invoiced: Number(r.invoiced || 0) }));
+    } catch (e) { console.error('trend query error:', e.message); }
+
+    // New vs Repeat customers
+    let newCustomers = 0, repeatCustomers = 0;
+    try {
+      const newRepeatRes = await q(
+        `WITH period_customers AS (
+          SELECT DISTINCT code FROM sql_salesinvoices
+          WHERE ${periodSql} AND (cancelled = false OR cancelled IS NULL) AND code IS NOT NULL
+        ),
+        prior_customers AS (
+          SELECT DISTINCT code FROM sql_salesinvoices
+          WHERE docdate < ${from ? `$${periodParams.length + 1}::date` : `CURRENT_DATE - $${periodParams.length + 1}::int`} AND (cancelled = false OR cancelled IS NULL) AND code IS NOT NULL
+        )
+        SELECT
+          COUNT(*) FILTER (WHERE pc.code IS NOT NULL AND pr.code IS NOT NULL) AS repeat_count,
+          COUNT(*) FILTER (WHERE pc.code IS NOT NULL AND pr.code IS NULL) AS new_count
+        FROM period_customers pc
+        LEFT JOIN prior_customers pr ON pr.code = pc.code`,
+        [...periodParams, from || days]
+      );
+      repeatCustomers = Number(newRepeatRes.rows[0]?.repeat_count || 0);
+      newCustomers = Number(newRepeatRes.rows[0]?.new_count || 0);
+    } catch (e) { console.error('new/repeat query error:', e.message); }
+
+    const unassigned = agents.find(a => a.name === 'Unassigned');
 
     return res.status(200).json({
       agents,
       products,
+      monthlyTrend,
+      topCustomers,
       kpis: {
         growth: growthPct != null ? `${growthPct > 0 ? '+' : ''}${growthPct}%` : '—',
-        growthTrend: null,
+        currentRev,
+        previousRev,
         topCustomerShare,
+        totalCustomers: repeatCustomers + newCustomers,
+        newCustomers,
+        repeatCustomers,
+        unassignedOrders: unassigned?.orders || 0,
+        unassignedRevenue: unassigned?.revenue || 0,
+        topProductRevenue: products[0]?.revenue || 0,
+        topProductName: products[0]?.name || '—',
       },
       source: 'postgres',
     });
