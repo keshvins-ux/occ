@@ -267,8 +267,8 @@ export default function SalesAnalytics() {
           />
         </Card>
 
-        {/* Top Products */}
-        <Card title="Top Products" subtitle={`By revenue · ${range.label}`}>
+        {/* Top Products with Margins */}
+        <Card title="Top Products" subtitle={`Revenue & margin · ${range.label}`}>
           <SortableTable
             rows={products.slice(0, 12)}
             rowKey={(r) => r.code || r.name}
@@ -294,13 +294,23 @@ export default function SalesAnalytics() {
                 key: "revenue",
                 label: "Revenue",
                 align: "right",
+                render: (r) => (
+                  <span style={{ fontWeight: 700, color: COLORS.text }}>{fmt(r.revenue || 0)}</span>
+                ),
+              },
+              {
+                key: "marginPct",
+                label: "Margin",
+                align: "right",
+                sortValue: (r) => r.marginPct ?? -1,
                 render: (r) => {
-                  const totalRev = products.reduce((s, p) => s + (p.revenue || 0), 0);
-                  const share = totalRev > 0 ? ((r.revenue / totalRev) * 100).toFixed(0) : 0;
+                  if (r.marginPct == null) return <span style={{ fontSize: 11, color: COLORS.textFaint }}>—</span>;
+                  const color = r.marginPct >= 40 ? COLORS.successDark : r.marginPct >= 20 ? COLORS.warningDark : COLORS.dangerDark;
+                  const bg = r.marginPct >= 40 ? COLORS.successBg : r.marginPct >= 20 ? COLORS.warningBg : COLORS.dangerBg;
                   return (
                     <div style={{ textAlign: "right" }}>
-                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(r.revenue || 0)}</div>
-                      <div style={{ fontSize: 10, color: COLORS.textFaint, marginTop: 1 }}>{share}% of total</div>
+                      <Pill color={color} bg={bg} size="sm">{r.marginPct}%</Pill>
+                      <div style={{ fontSize: 10, color: COLORS.textFaint, marginTop: 3 }}>{fmt(r.marginValue)}</div>
                     </div>
                   );
                 },
