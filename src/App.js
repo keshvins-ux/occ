@@ -12,6 +12,7 @@ import ManagementAROverview from "./sections/ManagementAROverview";
 import ManagementCustomers from "./sections/ManagementCustomers";
 import ManagementSOLifecycle from "./sections/ManagementSOLifecycle";
 import POIntake from "./sections/POIntake";
+import DocumentTracker from "./sections/DocumentTracker";
 import Placeholder from "./sections/Placeholder";
 
 function AppInner() {
@@ -68,6 +69,7 @@ function renderSection(section, sub) {
   }
   // PO Intake
   if (section === "po") {
+    if (sub === 1) return <DocumentTracker />;
     return <POIntake />;
   }
   // Production (Session 2)
