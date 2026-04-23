@@ -18,6 +18,7 @@ const CHAIN_LABELS = {
   pending_invoice: { label: "Pending Invoice", color: COLORS.warningDark, bg: COLORS.warningBg },
   pending_do: { label: "Pending DO", color: COLORS.infoDark, bg: COLORS.infoBg },
   pending_both: { label: "Pending DO & Invoice", color: COLORS.dangerDark, bg: COLORS.dangerBg },
+  partial: { label: "Partial Delivery", color: COLORS.warningDark, bg: COLORS.warningBg },
 };
 
 export default function DocumentTracker() {
