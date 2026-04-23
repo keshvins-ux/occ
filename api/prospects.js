@@ -985,15 +985,16 @@ async function handleSOLifecycle(req, res) {
         so.companyname AS customer,
         so.docamt::numeric AS amount,
         so.cancelled,
-        so.docref3,
         so.docref1,
+        so.docref3,
+        so.docref4,
         MIN(sol.deliverydate) AS delivery_date,
         SUM(sol.qty::numeric) AS total_qty,
         SUM(COALESCE(sol.offsetqty::numeric, 0)) AS delivered_qty
       FROM sql_salesorders so
       LEFT JOIN sql_so_lines sol ON sol.dockey = so.dockey
       WHERE so.docdate >= CURRENT_DATE - $1::int
-      GROUP BY so.dockey, so.docno, so.docdate, so.code, so.companyname, so.docamt, so.cancelled, so.docref3, so.docref1
+      GROUP BY so.dockey, so.docno, so.docdate, so.code, so.companyname, so.docamt, so.cancelled, so.docref1, so.docref3, so.docref4
       ORDER BY so.docdate DESC
       LIMIT 500
       `,
@@ -1001,9 +1002,11 @@ async function handleSOLifecycle(req, res) {
     );
     const sos = r.rows.map((row) => {
       const ref3 = String(row.docref3 || '').toUpperCase().trim();
+      const ref4 = String(row.docref4 || '').toUpperCase().trim();
       let status = 'active';
       if (row.cancelled || ref3 === 'CANCELLED') status = 'cancelled';
-      else if (ref3.startsWith('DONE')) status = 'complete';
+      else if (ref3.startsWith('DONE') || ref4.includes('INVOICED')) status = 'complete';
+      else if (ref3.startsWith('PARTIAL')) status = 'partial';
       else if (Number(row.delivered_qty) > 0 && Number(row.delivered_qty) < Number(row.total_qty))
         status = 'partial';
 
@@ -1799,13 +1802,25 @@ async function handleDocumentTracker(req, res) {
     // Build entries
     const entries = soRes.rows.map(so => {
       const ref3 = String(so.docref3 || '').toUpperCase().trim();
-      const isDone = ref3.startsWith('DONE');
-      const isCancelledRef3 = ref3 === 'CANCELLED';
+      const ref4 = String(so.docref4 || '').toUpperCase().trim();
 
-      // Skip cancelled SOs (either cancelled flag or Ref3=CANCELLED)
-      if (so.cancelled === true || isCancelledRef3) return null;
+      // Skip cancelled SOs
+      if (so.cancelled === true || ref3 === 'CANCELLED') return null;
 
-      // Try fromdockey linking
+      // Determine SO status from Ref3 and Ref4 — based on actual team usage in SQL Account:
+      // Ref3 starts with "DONE" = fully fulfilled (301+ SOs)
+      // Ref4 contains "INVOICED" = invoiced but Ref3 not updated to DONE (5 SOs)
+      // Ref3 starts with "PARTIAL" = partially delivered (3 SOs)
+      // Everything else = genuinely active (~23 SOs)
+      const isDone = ref3.startsWith('DONE') || ref4.includes('INVOICED');
+      const isPartial = ref3.startsWith('PARTIAL');
+
+      let status;
+      if (isDone) status = 'complete';
+      else if (isPartial) status = 'partial';
+      else status = 'active';
+
+      // fromdockey linking (secondary — only for OCC-created documents)
       const linkedDOs = dosBySO[so.dockey] || [];
       const linkedInvs = [];
       for (const d of linkedDOs) {
@@ -1813,17 +1828,17 @@ async function handleDocumentTracker(req, res) {
         linkedInvs.push(...invs);
       }
 
-      // Determine chain status based on SO completion status (primary) + fromdockey (secondary)
+      // Chain status: primary = SO status fields, secondary = fromdockey
       let chain;
       if (isDone) {
-        // SO is marked DONE — it's complete regardless of fromdockey
         chain = 'complete';
+      } else if (isPartial) {
+        chain = linkedInvs.length > 0 ? 'pending_do' : 'pending_both';
       } else if (linkedDOs.length > 0 && linkedInvs.length > 0) {
         chain = 'complete';
-      } else if (linkedDOs.length > 0 && linkedInvs.length === 0) {
+      } else if (linkedDOs.length > 0) {
         chain = 'pending_invoice';
       } else {
-        // Active SO with no linked DO = needs both DO and Invoice
         chain = 'pending_both';
       }
 
@@ -1838,7 +1853,7 @@ async function handleDocumentTracker(req, res) {
         invoiceNote: so.docref4 || null,
         amount: Number(so.docamt || 0),
         date: so.docdate,
-        status: isDone ? 'complete' : 'active',
+        status,
         chain,
         dos: linkedDOs.map(d => ({ docno: d.docno, date: d.date, amount: d.amount })),
         invoices: linkedInvs.map(i => ({ docno: i.docno, date: i.date, amount: i.amount })),
