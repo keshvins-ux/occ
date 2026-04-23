@@ -73,7 +73,7 @@ export default async function handler(req, res) {
 <div class="header">
   <div class="logo">OCC — OPERATIONS COMMAND CENTRE</div>
   <h1>${title || 'Month vs Month Comparison'}</h1>
-  <div class="subtitle">Generated ${now} · Seri Rasa / Vertical Target Services Sdn. Bhd.</div>
+  <div class="subtitle">Generated ${now} · ${process.env.TENANT_NAME || 'Seri Rasa'} / ${process.env.TENANT_LEGAL || 'Vertical Target Services Sdn. Bhd.'}</div>
 </div>
 
 <div class="kpi-row">
@@ -157,7 +157,7 @@ ${brief?.brief ? `
 </div>
 
 <div class="footer">
-  OCC v2 · Seri Rasa / Vertical Target Services Sdn. Bhd. · Confidential · Generated ${now}
+  ${process.env.BRAND_NAME || 'OCC'} v2 · ${process.env.TENANT_NAME || 'Seri Rasa'} / ${process.env.TENANT_LEGAL || 'Vertical Target Services Sdn. Bhd.'} · Confidential · Generated ${now}
 </div>
 </body>
 </html>`;

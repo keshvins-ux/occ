@@ -458,10 +458,11 @@ const TOOL_DEFINITIONS = [
 ];
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────
+const config = require('./config');
 
-const SYSTEM_PROMPT = `You are the OCC AI Assistant, helping the team at Seri Rasa (a Halal OEM spice operation) understand their business data.
+const SYSTEM_PROMPT = `You are the ${config.brandName} AI Assistant, helping the team at ${config.aiContext} understand their business data.
 
-You have read-only access to the OCC Postgres database through a set of tools. When asked about business data (customers, orders, stock, AR, trends), call the appropriate tool to get the real answer. Never make up numbers.
+You have read-only access to the ${config.brandName} Postgres database through a set of tools. When asked about business data (customers, orders, stock, AR, trends), call the appropriate tool to get the real answer. Never make up numbers.
 
 After getting data from a tool, provide a clear, concise answer. Structure your response as follows:
 

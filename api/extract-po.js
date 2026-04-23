@@ -39,11 +39,15 @@ async function db(sql, params = []) {
 
 const MODELS = ['claude-opus-4-6', 'claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022'];
 
-const SYSTEM_PROMPT = `You are a purchase order extraction engine for Seri Rasa (also known as Mazza Spice / Rempah Emas), a Malaysian halal spice manufacturer.
+const config = require('./config');
+
+function buildSystemPrompt() {
+  const sellerList = config.sellerNames.map(n => `"${n}"`).join(', ');
+  return `You are a purchase order extraction engine for ${config.aiContext}.
 
 CRITICAL RULES:
 1. Your ENTIRE response must be a single valid JSON object. Start with { and end with }. No text before or after. No markdown. No explanations.
-2. The "customerName" is the company who WROTE and SENT the PO (the BUYER). NOT "Mazza Spice", "Seri Rasa", or "Rempah Emas" — these are the SELLER.
+2. The "customerName" is the company who WROTE and SENT the PO (the BUYER). NOT ${sellerList} — these are the SELLER.
 3. Extract ALL product line items. Ignore rows that are clearly not products (references, invoice numbers, empty rows).
 4. For each field, provide a confidence score (0-100).
 5. Match products using fuzzy/semantic matching:
@@ -60,6 +64,7 @@ CRITICAL RULES:
    - Set unitprice_source to "from_so" with the SO number and date
 7. Quantities must be exact whole numbers as written on the PO.
 8. For PDF documents, provide bbox coordinates as normalised values (0-1 range).`;
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -375,7 +380,7 @@ async function callClaude(apiKey, model, messages) {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({ model, max_tokens: 4000, system: SYSTEM_PROMPT, messages }),
+    body: JSON.stringify({ model, max_tokens: 4000, system: buildSystemPrompt(), messages }),
     signal: AbortSignal.timeout(55000),
   });
   if (!resp.ok) {

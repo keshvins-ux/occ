@@ -26,7 +26,7 @@ export default async function handler(req, res) {
         tools: [{ type: "web_search_20250305", name: "web_search" }],
         messages: [{
           role: "user",
-          content: `You are a B2B sales intelligence analyst for Seri Rasa, a Malaysian Halal OEM spice and condiment manufacturer in Rawang, Selangor.
+          content: `You are a B2B sales intelligence analyst for ${process.env.TENANT_NAME || 'Seri Rasa'}, a ${process.env.TENANT_INDUSTRY || 'Malaysian Halal OEM spice and condiment manufacturer'} in ${process.env.TENANT_LOCATION || 'Rawang, Selangor'}.
 
 Search the web for accurate, verified information about this company and return a structured intelligence card.
 

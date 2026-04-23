@@ -1620,7 +1620,8 @@ async function handleComparisonBrief(req, res) {
     const growing = custRes.rows.filter(r => Number(r.curr_amt) > Number(r.prev_amt) && Number(r.prev_amt) > 0)
       .map(r => `${r.name}: RM ${Number(r.prev_amt).toFixed(0)} → RM ${Number(r.curr_amt).toFixed(0)} (+${((Number(r.curr_amt) - Number(r.prev_amt)) / Number(r.prev_amt) * 100).toFixed(0)}%)`);
 
-    const prompt = `You are a business analyst for Seri Rasa (Rempah Emas), a Malaysian halal spice manufacturer. The CEO needs a brief executive summary comparing this month's sales performance against last month.
+    const config = require('./config');
+    const prompt = `You are a business analyst for ${config.aiContext}. The CEO needs a brief executive summary comparing this month's sales performance against last month.
 
 DATA:
 - ${prevName} total invoiced: RM ${totalPrev.toFixed(2)}
