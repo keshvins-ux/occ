@@ -1,0 +1,63 @@
+# ============================================================
+# OCC ERP — Docker Compose
+# Spins up: API server + sync, Postgres, Redis
+#
+# Usage:
+#   docker-compose --env-file .env up -d          # start
+#   docker-compose --env-file .env down            # stop
+#   docker-compose --env-file .env logs -f occ     # view logs
+#
+# For a new customer:
+#   1. cp .env.template .env.customer-b
+#   2. Fill in customer-b's SQL Account credentials + DB
+#   3. docker-compose --env-file .env.customer-b up -d
+# ============================================================
+
+version: '3.8'
+
+services:
+  occ:
+    build: .
+    container_name: occ-${TENANT_ID:-serirasa}
+    restart: unless-stopped
+    ports:
+      - "${OCC_PORT:-3000}:3000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - occ-logs:/var/log
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: occ-db-${TENANT_ID:-serirasa}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: occ_erp
+      POSTGRES_USER: occ_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-OCCseri2026!rawang}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - occ-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U occ_user -d occ_erp"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: occ-redis-${TENANT_ID:-serirasa}
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - occ-redis:/data
+
+volumes:
+  occ-pgdata:
+  occ-redis:
+  occ-logs:
