@@ -36,46 +36,39 @@ export default function CreateInvoice() {
     finally { setLoading(false); }
   }
 
-  function selectEntry(entry) {
+  async function selectEntry(entry) {
     setSelectedEntry(entry);
     setError("");
-    // Build line items from the DO (using SO data since DO lines mirror SO lines)
-    // We use the SO amount/items as the invoice basis
-    const doTotal = entry.dos.reduce((s, d) => s + d.amount, 0);
-    // Try loading SO balance for line items
-    fetchJson(`/api/create-doc?type=so_balance&docno=${entry.soNo}`)
-      .then(balRes => {
-        const lines = (balRes.lines || []).map(l => ({
-          itemcode: l.itemcode,
-          description: l.description,
-          uom: l.uom || "UNIT",
-          qty: Number(l.qty || 0),
-          unitprice: Number(l.unitprice || 0),
-        }));
-        if (lines.length > 0) {
-          setItems(lines);
-        } else {
-          // Fallback: single line item from SO amount
-          setItems([{
-            itemcode: "MISC",
-            description: `Invoice for ${entry.soNo}`,
-            uom: "UNIT",
-            qty: 1,
-            unitprice: entry.amount,
-          }]);
-        }
-        setStage("review");
-      })
-      .catch(() => {
-        setItems([{
-          itemcode: "MISC",
-          description: `Invoice for ${entry.soNo}`,
-          uom: "UNIT",
-          qty: 1,
-          unitprice: entry.amount,
-        }]);
-        setStage("review");
-      });
+    setItems([]);
+    setStage("review"); // show review with loading state
+
+    try {
+      const balRes = await fetchJson(`/api/create-doc?type=so_balance&docno=${entry.soNo}`);
+      if (balRes.error) {
+        setError(`Could not load SO lines: ${balRes.error}`);
+        return;
+      }
+      const rawItems = balRes.items || [];
+      if (rawItems.length === 0) {
+        setError(`No line items found for ${entry.soNo}. Cannot create invoice without line items.`);
+        return;
+      }
+      const lines = rawItems.map(l => ({
+        itemcode: l.itemcode,
+        description: l.description,
+        uom: l.uom || "UNIT",
+        qty: Number(l.originalQty || l.qty || 0),
+        unitprice: Number(l.unitprice || 0),
+      })).filter(l => l.qty > 0);
+
+      if (lines.length === 0) {
+        setError(`All items in ${entry.soNo} have zero quantity. Cannot create invoice.`);
+        return;
+      }
+      setItems(lines);
+    } catch (e) {
+      setError(`Failed to load SO lines for invoice: ${e.message}. SQL Account API may be slow — try again.`);
+    }
   }
 
   function updateItem(idx, field, value) {

@@ -25,7 +25,7 @@ export default function DocumentTracker() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("all");
+  const [filter, setFilter] = useState("active");
   const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
@@ -72,14 +72,16 @@ export default function DocumentTracker() {
       {/* KPI Strip */}
       <div style={{ display: "flex", gap: 16, marginBottom: 24, flexWrap: "wrap" }}>
         <KpiCard icon="package" iconBg={COLORS.infoBg} iconColor={COLORS.info}
-          label="Total SOs" value={fmt0(stats.total || 0)} />
+          label="Active SOs" value={fmt0(stats.active || 0)} trend={`${fmt0(stats.total || 0)} total (incl. completed)`} />
         <KpiCard icon="shield" iconBg={COLORS.successBg} iconColor={COLORS.success}
           label="Complete (SO→DO→INV)" value={fmt0(stats.complete || 0)} />
+        <KpiCard icon="package" iconBg={BRAND.accentGlow} iconColor={BRAND.accent}
+          label="Active SOs" value={fmt0(stats.active || 0)}
+          trend={stats.outstanding > 0 ? `${fmt(stats.outstanding)} outstanding` : undefined} />
         <KpiCard icon="alert" iconBg={COLORS.warningBg} iconColor={COLORS.warningDark}
           label="Pending Invoice" value={fmt0(stats.pendingInvoice || 0)} />
         <KpiCard icon="alert" iconBg={COLORS.dangerBg} iconColor={COLORS.danger}
-          label="Pending Both" value={fmt0(stats.pendingBoth || 0)}
-          trend={stats.outstanding > 0 ? `${fmt(stats.outstanding)} outstanding` : undefined} />
+          label="Pending DO & Invoice" value={fmt0(stats.pendingBoth || 0)} />
       </div>
 
       {/* Filters + Search */}
@@ -263,11 +265,14 @@ function ExpandedDetail({ entry }) {
         )}
       </div>
 
-      {/* Customer + PO info */}
-      <div style={{ fontSize: 12, color: COLORS.textMuted }}>
-        <span style={{ fontWeight: 600, color: COLORS.text }}>{entry.customer}</span>
-        {entry.customerCode && <span style={{ marginLeft: 8, fontFamily: FONT.mono, color: COLORS.textFaint }}>{entry.customerCode}</span>}
-        {entry.poRef && <span style={{ marginLeft: 16 }}>PO: {entry.poRef}</span>}
+      {/* Customer + PO info + Ref fields */}
+      <div style={{ fontSize: 12, color: COLORS.textMuted, display: "flex", flexWrap: "wrap", gap: 16 }}>
+        <span><span style={{ fontWeight: 600, color: COLORS.text }}>{entry.customer}</span>
+        {entry.customerCode && <span style={{ marginLeft: 8, fontFamily: FONT.mono, color: COLORS.textFaint }}>{entry.customerCode}</span>}</span>
+        {entry.poRef && <span>PO: <strong>{entry.poRef}</strong></span>}
+        {entry.deliveryInfo && <span>Delivery: <strong>{entry.deliveryInfo}</strong></span>}
+        {entry.statusNote && <span>Status: <strong>{entry.statusNote}</strong></span>}
+        {entry.invoiceNote && <span style={{ color: COLORS.infoDark }}>Invoice: <strong>{entry.invoiceNote}</strong></span>}
       </div>
     </div>
   );

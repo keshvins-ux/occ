@@ -37,23 +37,37 @@ export default function CreateDO() {
   async function selectSO(so) {
     setSelectedSO(so);
     setError("");
-    // Load SO line items with balances
+    setItems([]); // clear any previous items
+    setStage("review"); // show review immediately with loading state
+    // Load SO line items with balances from SQL Account API
     try {
       const balRes = await fetchJson(`/api/create-doc?type=so_balance&docno=${so.docno}`);
-      const lines = (balRes.lines || []).filter(l => l.balanceQty > 0).map(l => ({
+      if (balRes.error) {
+        setError(`SO balance error: ${balRes.error}`);
+        return;
+      }
+      const rawItems = balRes.items || [];
+      if (rawItems.length === 0) {
+        setError(`No line items found for ${so.docno}. The SO may not have detail lines in SQL Account.`);
+        return;
+      }
+      const lines = rawItems.filter(l => l.balanceQty > 0).map(l => ({
         itemcode: l.itemcode,
         description: l.description,
         uom: l.uom || "UNIT",
         maxQty: l.balanceQty,
-        qty: l.balanceQty, // default to full delivery
+        qty: l.balanceQty,
         unitprice: l.unitprice || 0,
         dtlkey: l.dtlkey,
         selected: true,
       }));
+      if (lines.length === 0) {
+        setError(`All items in ${so.docno} are fully delivered (balance = 0). No remaining items for DO.`);
+        return;
+      }
       setItems(lines);
-      setStage("review");
     } catch (e) {
-      setError(`Failed to load SO lines: ${e.message}`);
+      setError(`Failed to load SO lines: ${e.message}. The SQL Account API may be slow — try again.`);
     }
   }
 
