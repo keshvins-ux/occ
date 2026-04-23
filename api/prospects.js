@@ -978,28 +978,32 @@ async function handleSOLifecycle(req, res) {
     const r = await q(
       `
       SELECT
+        so.dockey,
         so.docno,
         so.docdate AS date,
+        so.code,
         so.companyname AS customer,
         so.docamt::numeric AS amount,
         so.cancelled,
         so.docref3,
+        so.docref1,
         MIN(sol.deliverydate) AS delivery_date,
         SUM(sol.qty::numeric) AS total_qty,
-        SUM(sol.offsetqty::numeric) AS delivered_qty
+        SUM(COALESCE(sol.offsetqty::numeric, 0)) AS delivered_qty
       FROM sql_salesorders so
       LEFT JOIN sql_so_lines sol ON sol.dockey = so.dockey
       WHERE so.docdate >= CURRENT_DATE - $1::int
-      GROUP BY so.docno, so.docdate, so.companyname, so.docamt, so.cancelled, so.docref3
+      GROUP BY so.dockey, so.docno, so.docdate, so.code, so.companyname, so.docamt, so.cancelled, so.docref3, so.docref1
       ORDER BY so.docdate DESC
       LIMIT 500
       `,
       [days]
     );
     const sos = r.rows.map((row) => {
+      const ref3 = String(row.docref3 || '').toUpperCase().trim();
       let status = 'active';
-      if (row.cancelled) status = 'cancelled';
-      else if (String(row.docref3 || '').toUpperCase().trim() === 'DONE') status = 'complete';
+      if (row.cancelled || ref3 === 'CANCELLED') status = 'cancelled';
+      else if (ref3.startsWith('DONE')) status = 'complete';
       else if (Number(row.delivered_qty) > 0 && Number(row.delivered_qty) < Number(row.total_qty))
         status = 'partial';
 
@@ -1010,10 +1014,13 @@ async function handleSOLifecycle(req, res) {
       }
 
       return {
+        dockey: row.dockey,
         docno: row.docno,
         date: row.date,
+        customerCode: row.code,
         customer: row.customer,
         amount: Number(row.amount || 0),
+        poRef: row.docref1 || null,
         deliveryDate,
         status,
       };
@@ -1735,47 +1742,49 @@ export async function handleV2Type(req, res, type) {
   }
 }
 
-// Document Tracker — SO → DO → Invoice chain linked via fromdockey
+// Document Tracker — correct logic based on SO status
+// Active SOs = need DO and/or Invoice (genuinely pending)
+// Completed SOs (docref3=DONE) = already fulfilled
+// fromdockey linking used where available, but SO status is the primary indicator
 async function handleDocumentTracker(req, res) {
   try {
-    // Get all active SOs (non-cancelled, last 6 months)
+    // Get all SOs from last 6 months (non-cancelled)
     const soRes = await q(`
       SELECT dockey, docno, docdate::text AS docdate, code, companyname,
-             docamt::numeric AS docamt, cancelled, docref3, docref1
+             docamt::numeric AS docamt, cancelled, docref1, docref2, docref3, docref4
       FROM sql_salesorders
       WHERE docdate >= CURRENT_DATE - INTERVAL '6 months'
+        AND (cancelled = false OR cancelled IS NULL)
       ORDER BY docdate DESC, dockey DESC
       LIMIT 500
     `);
 
-    // Get DOs linked to SOs via fromdockey on DO lines
+    // Get DOs linked via fromdockey (where available)
     const doRes = await q(`
-      SELECT DISTINCT ON (dl.fromdockey, d.dockey)
-        dl.fromdockey AS so_dockey,
+      SELECT dl.fromdockey AS so_dockey,
         d.dockey, d.docno, d.docdate::text AS docdate, d.docamt::numeric AS docamt
       FROM sql_do_lines dl
       JOIN sql_deliveryorders d ON d.dockey = dl.dockey
       WHERE dl.fromdockey IS NOT NULL AND (d.cancelled = false OR d.cancelled IS NULL)
-      ORDER BY dl.fromdockey, d.dockey DESC
+      GROUP BY dl.fromdockey, d.dockey, d.docno, d.docdate, d.docamt
     `);
 
-    // Get invoices linked to DOs via fromdockey on invoice lines
+    // Get invoices linked via fromdockey (where available)
     const invRes = await q(`
-      SELECT DISTINCT ON (il.fromdockey, i.dockey)
-        il.fromdockey AS do_dockey,
+      SELECT il.fromdockey AS do_dockey,
         i.dockey, i.docno, i.docdate::text AS docdate, i.docamt::numeric AS docamt
       FROM sql_inv_lines il
       JOIN sql_salesinvoices i ON i.dockey = il.dockey
       WHERE il.fromdockey IS NOT NULL AND (i.cancelled = false OR i.cancelled IS NULL)
-      ORDER BY il.fromdockey, i.dockey DESC
+      GROUP BY il.fromdockey, i.dockey, i.docno, i.docdate, i.docamt
     `);
 
-    // Build lookup maps
+    // Build lookup maps for fromdockey-linked docs
     const dosBySO = {};
     for (const row of doRes.rows) {
       if (!dosBySO[row.so_dockey]) dosBySO[row.so_dockey] = [];
       dosBySO[row.so_dockey].push({
-        dockey: row.dockey, docno: row.docno, date: row.docdate, amount: Number(row.docamt || 0),
+        docno: row.docno, date: row.docdate, amount: Number(row.docamt || 0), dockey: row.dockey,
       });
     }
 
@@ -1783,31 +1792,40 @@ async function handleDocumentTracker(req, res) {
     for (const row of invRes.rows) {
       if (!invsByDO[row.do_dockey]) invsByDO[row.do_dockey] = [];
       invsByDO[row.do_dockey].push({
-        dockey: row.dockey, docno: row.docno, date: row.docdate, amount: Number(row.docamt || 0),
+        docno: row.docno, date: row.docdate, amount: Number(row.docamt || 0),
       });
     }
 
-    // Build chain per SO
+    // Build entries
     const entries = soRes.rows.map(so => {
-      const cancelled = so.cancelled === true;
-      const done = String(so.docref3 || '').toUpperCase().trim() === 'DONE';
-      const status = cancelled ? 'cancelled' : done ? 'complete' : 'active';
+      const ref3 = String(so.docref3 || '').toUpperCase().trim();
+      const isDone = ref3.startsWith('DONE');
+      const isCancelledRef3 = ref3 === 'CANCELLED';
 
-      const dos = dosBySO[so.dockey] || [];
-      const invoices = [];
-      for (const d of dos) {
+      // Skip cancelled SOs (either cancelled flag or Ref3=CANCELLED)
+      if (so.cancelled === true || isCancelledRef3) return null;
+
+      // Try fromdockey linking
+      const linkedDOs = dosBySO[so.dockey] || [];
+      const linkedInvs = [];
+      for (const d of linkedDOs) {
         const invs = invsByDO[d.dockey] || [];
-        invoices.push(...invs);
+        linkedInvs.push(...invs);
       }
 
-      const hasDO = dos.length > 0;
-      const hasInvoice = invoices.length > 0;
-
-      let chain = 'pending'; // no DO, no Invoice
-      if (hasDO && hasInvoice) chain = 'complete';
-      else if (hasDO && !hasInvoice) chain = 'pending_invoice';
-      else if (!hasDO && hasInvoice) chain = 'pending_do'; // unusual
-      else chain = 'pending_both';
+      // Determine chain status based on SO completion status (primary) + fromdockey (secondary)
+      let chain;
+      if (isDone) {
+        // SO is marked DONE — it's complete regardless of fromdockey
+        chain = 'complete';
+      } else if (linkedDOs.length > 0 && linkedInvs.length > 0) {
+        chain = 'complete';
+      } else if (linkedDOs.length > 0 && linkedInvs.length === 0) {
+        chain = 'pending_invoice';
+      } else {
+        // Active SO with no linked DO = needs both DO and Invoice
+        chain = 'pending_both';
+      }
 
       return {
         soNo: so.docno,
@@ -1815,23 +1833,27 @@ async function handleDocumentTracker(req, res) {
         customer: so.companyname,
         customerCode: so.code,
         poRef: so.docref1 || null,
+        deliveryInfo: so.docref2 || null,
+        statusNote: so.docref3 || null,
+        invoiceNote: so.docref4 || null,
         amount: Number(so.docamt || 0),
         date: so.docdate,
-        status,
+        status: isDone ? 'complete' : 'active',
         chain,
-        dos: dos.map(d => ({ docno: d.docno, date: d.date, amount: d.amount })),
-        invoices: invoices.map(i => ({ docno: i.docno, date: i.date, amount: i.amount })),
+        dos: linkedDOs.map(d => ({ docno: d.docno, date: d.date, amount: d.amount })),
+        invoices: linkedInvs.map(i => ({ docno: i.docno, date: i.date, amount: i.amount })),
       };
-    }).filter(e => e.status !== 'cancelled');
+    }).filter(Boolean); // remove cancelled entries (returned as null)
 
-    // Stats
+    // Stats — only count genuinely active SOs as pending
+    const activeEntries = entries.filter(e => e.status === 'active');
     const stats = {
       total: entries.length,
+      active: activeEntries.length,
       complete: entries.filter(e => e.chain === 'complete').length,
-      pendingInvoice: entries.filter(e => e.chain === 'pending_invoice').length,
-      pendingDO: entries.filter(e => e.chain === 'pending_do').length,
-      pendingBoth: entries.filter(e => e.chain === 'pending_both').length,
-      outstanding: entries.filter(e => e.chain !== 'complete').reduce((s, e) => s + e.amount, 0),
+      pendingInvoice: activeEntries.filter(e => e.chain === 'pending_invoice').length,
+      pendingBoth: activeEntries.filter(e => e.chain === 'pending_both').length,
+      outstanding: activeEntries.filter(e => e.chain !== 'complete').reduce((s, e) => s + e.amount, 0),
     };
 
     return res.status(200).json({ entries, stats, source: 'postgres' });
