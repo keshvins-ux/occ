@@ -9,7 +9,7 @@ import { useDateRange } from "../contexts/DateRangeContext";
 export const SECTIONS = [
   { id: "sales", label: "Sales", subs: ["Overview", "Pipeline", "Analytics"], icon: "chart" },
   { id: "management", label: "Management", subs: ["AR Overview", "Customers", "SO Lifecycle"], icon: "monitor" },
-  { id: "po", label: "PO Intake", subs: ["Submit PO", "Document Tracker"], icon: "download" },
+  { id: "po", label: "Documents", subs: ["Submit PO", "Create DO", "Create Invoice", "Document Tracker"], icon: "download" },
   { id: "production", label: "Production", subs: ["Order Queue", "Gap Analysis", "Purchase List", "Capacity", "Floor Display"], icon: "factory" },
   { id: "procurement", label: "Procurement", subs: ["Supplier POs", "GRN", "Stock", "Suppliers"], icon: "cart" },
   { id: "compliance", label: "Compliance", subs: ["Dashboard", "Certificates", "Traceability"], icon: "shield" },
