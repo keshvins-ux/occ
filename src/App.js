@@ -12,6 +12,8 @@ import ManagementAROverview from "./sections/ManagementAROverview";
 import ManagementCustomers from "./sections/ManagementCustomers";
 import ManagementSOLifecycle from "./sections/ManagementSOLifecycle";
 import POIntake from "./sections/POIntake";
+import CreateDO from "./sections/CreateDO";
+import CreateInvoice from "./sections/CreateInvoice";
 import DocumentTracker from "./sections/DocumentTracker";
 import Placeholder from "./sections/Placeholder";
 
@@ -67,9 +69,12 @@ function renderSection(section, sub) {
     if (sub === 1) return <ManagementCustomers />;
     if (sub === 2) return <ManagementSOLifecycle />;
   }
-  // PO Intake
+  // Documents (PO Intake + DO + Invoice + Tracker)
   if (section === "po") {
-    if (sub === 1) return <DocumentTracker />;
+    if (sub === 0) return <POIntake />;
+    if (sub === 1) return <CreateDO />;
+    if (sub === 2) return <CreateInvoice />;
+    if (sub === 3) return <DocumentTracker />;
     return <POIntake />;
   }
   // Production (Session 2)
