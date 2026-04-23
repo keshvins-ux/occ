@@ -105,7 +105,7 @@ export default function Layout({ active, sub, onNavigate, children }) {
                 fontWeight: 600,
               }}
             >
-              Command Centre
+              {process.env.REACT_APP_BRAND_TAGLINE || 'Command Centre'}
             </div>
           </div>
         </div>

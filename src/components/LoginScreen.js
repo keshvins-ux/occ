@@ -236,7 +236,7 @@ export default function LoginScreen() {
             textAlign: "center",
           }}
         >
-          Seri Rasa / Vertical Target Services Sdn. Bhd.
+          {process.env.REACT_APP_TENANT_LEGAL || 'Seri Rasa / Vertical Target Services Sdn. Bhd.'}
         </div>
       </div>
     </div>
