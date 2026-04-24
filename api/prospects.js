@@ -332,7 +332,7 @@ export default async function handler(req, res) {
       'overview', 'ar_overview', 'customers', 'so_lifecycle',
       'pipeline', 'analytics', 'comparison', 'comparison_detail', 'comparison_brief', 'top_products',
       'document_tracker',
-      'production_queue', 'production_gap', 'production_purchase',
+      'production_overview', 'production_brief', 'production_queue', 'production_gap', 'production_purchase',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -1742,6 +1742,10 @@ export async function handleV2Type(req, res, type) {
       return handleTopProducts(req, res);
     case 'document_tracker':
       return handleDocumentTracker(req, res);
+    case 'production_overview':
+      return handleProductionOverview(req, res);
+    case 'production_brief':
+      return handleProductionBrief(req, res);
     case 'production_queue':
       return handleProductionQueue(req, res);
     case 'production_gap':
@@ -1892,6 +1896,303 @@ async function handleDocumentTracker(req, res) {
 //       occ_bom_headers + occ_bom_lines (BOM explosion)
 //       sql_stockitems (current stock balances)
 // ══════════════════════════════════════════════════════════════
+
+// Production AI Brief — Opus analysis of production MoM trends
+async function handleProductionBrief(req, res) {
+  try {
+    const config = require('./config');
+
+    // Gather production data for AI
+    const momRes = await q(`
+      WITH curr AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name,
+               SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_so_lines sol JOIN sql_salesorders so ON so.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      ),
+      prev AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name,
+               SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_so_lines sol JOIN sql_salesorders so ON so.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      )
+      SELECT COALESCE(c.itemcode, p.itemcode) AS code, COALESCE(c.name, p.name) AS name,
+             COALESCE(p.qty, 0) AS prev_qty, COALESCE(c.qty, 0) AS curr_qty,
+             COALESCE(p.revenue, 0) AS prev_rev, COALESCE(c.revenue, 0) AS curr_rev
+      FROM curr c FULL OUTER JOIN prev p ON p.itemcode = c.itemcode
+      ORDER BY COALESCE(c.revenue, 0) DESC
+    `);
+
+    // Stock summary
+    const stockRes = await q(`
+      SELECT COUNT(*) AS total,
+             COUNT(*) FILTER (WHERE balsqty::numeric < 0) AS negative,
+             COUNT(*) FILTER (WHERE balsqty::numeric = 0) AS zero_stock
+      FROM sql_stockitems WHERE code IS NOT NULL
+    `);
+
+    // Price alerts
+    const priceRes = await q(`
+      WITH prices AS (
+        SELECT pil.itemcode, MAX(pil.description) AS name,
+               MIN(CASE WHEN pi.docdate >= CURRENT_DATE - INTERVAL '6 months' AND pi.docdate < CURRENT_DATE - INTERVAL '3 months' THEN pil.unitprice::numeric END) AS early_price,
+               MAX(CASE WHEN pi.docdate >= CURRENT_DATE - INTERVAL '1 month' THEN pil.unitprice::numeric END) AS recent_price
+        FROM sql_pi_lines pil JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
+        WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months' AND pil.itemcode IS NOT NULL
+        GROUP BY pil.itemcode
+        HAVING MIN(CASE WHEN pi.docdate >= CURRENT_DATE - INTERVAL '6 months' AND pi.docdate < CURRENT_DATE - INTERVAL '3 months' THEN pil.unitprice::numeric END) IS NOT NULL
+           AND MAX(CASE WHEN pi.docdate >= CURRENT_DATE - INTERVAL '1 month' THEN pil.unitprice::numeric END) IS NOT NULL
+      )
+      SELECT *, ROUND(((recent_price - early_price) / NULLIF(early_price, 0)) * 100, 1) AS pct_change
+      FROM prices WHERE early_price > 0
+      ORDER BY pct_change DESC LIMIT 10
+    `);
+
+    const monthName = new Date().toLocaleString('en-MY', { month: 'long', year: 'numeric' });
+    const prev = new Date(); prev.setMonth(prev.getMonth() - 1);
+    const prevName = prev.toLocaleString('en-MY', { month: 'long', year: 'numeric' });
+
+    const totalCurrQty = momRes.rows.reduce((s, r) => s + Number(r.curr_qty), 0);
+    const totalPrevQty = momRes.rows.reduce((s, r) => s + Number(r.prev_qty), 0);
+    const totalCurrRev = momRes.rows.reduce((s, r) => s + Number(r.curr_rev), 0);
+    const totalPrevRev = momRes.rows.reduce((s, r) => s + Number(r.prev_rev), 0);
+
+    const topProducts = momRes.rows.slice(0, 15).map(r =>
+      `${r.name} (${r.code}): ${Number(r.prev_qty)} → ${Number(r.curr_qty)} units, RM ${Number(r.prev_rev).toFixed(0)} → RM ${Number(r.curr_rev).toFixed(0)}`
+    );
+
+    const priceChanges = priceRes.rows.map(r =>
+      `${r.name} (${r.itemcode}): RM ${Number(r.early_price).toFixed(2)} → RM ${Number(r.recent_price).toFixed(2)} (${r.pct_change > 0 ? '+' : ''}${r.pct_change}%)`
+    );
+
+    const prompt = `You are the production intelligence analyst for ${config.aiContext}. The CEO needs a brief on production and stock status this month vs last month.
+
+DATA:
+- ${prevName} total ordered: ${totalPrevQty} units (RM ${totalPrevRev.toFixed(0)})
+- ${monthName} total ordered (MTD): ${totalCurrQty} units (RM ${totalCurrRev.toFixed(0)})
+- Stock items: ${stockRes.rows[0]?.total || 0} total, ${stockRes.rows[0]?.zero_stock || 0} at zero, ${stockRes.rows[0]?.negative || 0} negative
+- Note: ${monthName} is month-to-date (${new Date().getDate()} days in)
+
+TOP PRODUCTS BY ORDER VOLUME (${prevName} → ${monthName}):
+${topProducts.join('\n')}
+
+RAW MATERIAL PRICE CHANGES (6-month trend):
+${priceChanges.length > 0 ? priceChanges.join('\n') : 'No significant price changes detected.'}
+
+Write a concise CEO brief (3-4 paragraphs):
+1. Production volume summary — order trends, which products are growing/declining
+2. Stock health — items at zero or negative, risk of production delays
+3. Cost pressure — raw material price movements that affect margins
+4. Recommended actions — specific steps for production and procurement teams THIS WEEK
+
+IMPORTANT: Return ONLY a JSON object:
+{
+  "summary": "One-line headline",
+  "brief": "Full 3-4 paragraph analysis",
+  "actions": ["Action 1", "Action 2", "Action 3", "Action 4"]
+}`;
+
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) return res.status(200).json({ summary: 'AI brief unavailable', brief: '', actions: [] });
+
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-7-20250416',
+        max_tokens: 2000,
+        system: 'You are a production analyst. Respond ONLY with a valid JSON object. No text before or after.',
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const aiData = await aiRes.json();
+    const aiText = aiData.content?.[0]?.text || '{}';
+    let brief;
+    try {
+      const trimmed = aiText.trim();
+      const start = trimmed.indexOf('{');
+      const end = trimmed.lastIndexOf('}');
+      brief = JSON.parse(trimmed.slice(start, end + 1));
+    } catch {
+      brief = { summary: 'Analysis complete', brief: aiText, actions: [] };
+    }
+
+    return res.status(200).json(brief);
+  } catch (e) {
+    console.error('production_brief error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Production Overview — stock inventory, price trends, AI brief
+async function handleProductionOverview(req, res) {
+  try {
+    // 1. Full stock inventory with values
+    const stockRes = await q(`
+      SELECT si.code, si.description, si.occ_uom AS uom,
+             COALESCE(si.balsqty::numeric, 0) AS balance,
+             COALESCE(si.lastpurchaseprice::numeric, 0) AS last_purchase_price
+      FROM sql_stockitems si
+      WHERE si.code IS NOT NULL AND si.description IS NOT NULL
+      ORDER BY si.description
+    `);
+
+    // Get BOM ref costs for stock value calculation
+    const bomCostRes = await q(`
+      SELECT bl.component_code AS code, AVG(bl.ref_cost) AS avg_cost
+      FROM occ_bom_lines bl GROUP BY bl.component_code
+    `);
+    const bomCosts = {};
+    for (const r of bomCostRes.rows) bomCosts[r.code] = Number(r.avg_cost || 0);
+
+    const stockItems = stockRes.rows.map(r => {
+      const balance = Number(r.balance);
+      const unitCost = Number(r.last_purchase_price) || bomCosts[r.code] || 0;
+      return {
+        code: r.code, description: r.description, uom: r.uom,
+        balance, unitCost,
+        value: Math.round(balance * unitCost * 100) / 100,
+      };
+    });
+
+    const totalStockValue = stockItems.reduce((s, i) => s + Math.max(0, i.value), 0);
+    const totalItems = stockItems.length;
+    const zeroStock = stockItems.filter(i => i.balance <= 0).length;
+    const negativeStock = stockItems.filter(i => i.balance < 0).length;
+
+    // 2. Purchase price trends (last 6 months from purchase invoice lines)
+    const trendRes = await q(`
+      SELECT pil.itemcode, MAX(pil.description) AS name,
+             DATE_TRUNC('month', pi.docdate::date) AS month,
+             AVG(pil.unitprice::numeric) AS avg_price,
+             SUM(pil.qty::numeric) AS total_qty
+      FROM sql_pi_lines pil
+      JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
+      WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months'
+        AND (pi.cancelled = false OR pi.cancelled IS NULL)
+        AND pil.itemcode IS NOT NULL AND pil.unitprice IS NOT NULL
+      GROUP BY pil.itemcode, DATE_TRUNC('month', pi.docdate::date)
+      ORDER BY pil.itemcode, month
+    `);
+
+    // Build price trends per item
+    const trendMap = {};
+    for (const r of trendRes.rows) {
+      if (!trendMap[r.itemcode]) trendMap[r.itemcode] = { code: r.itemcode, name: r.name, months: [] };
+      trendMap[r.itemcode].months.push({
+        month: new Date(r.month).toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }),
+        price: Math.round(Number(r.avg_price) * 100) / 100,
+        qty: Number(r.total_qty),
+      });
+    }
+
+    // Calculate price change % for each item (latest vs earliest in 6 months)
+    const priceTrends = Object.values(trendMap).map(item => {
+      const sorted = item.months;
+      if (sorted.length < 2) return { ...item, change: 0, changePct: 0 };
+      const earliest = sorted[0].price;
+      const latest = sorted[sorted.length - 1].price;
+      const change = latest - earliest;
+      const changePct = earliest > 0 ? Math.round((change / earliest) * 1000) / 10 : 0;
+      return { ...item, latestPrice: latest, earliestPrice: earliest, change: Math.round(change * 100) / 100, changePct };
+    }).filter(t => t.months.length >= 2)
+      .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+
+    const priceAlerts = priceTrends.filter(t => t.changePct > 10);
+
+    // 3. Production readiness summary
+    const readinessRes = await q(`
+      WITH pending AS (
+        SELECT sol.itemcode, COUNT(DISTINCT so.dockey) AS order_count,
+               SUM(sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) AS pending_qty
+        FROM sql_salesorders so
+        JOIN sql_so_lines sol ON sol.dockey = so.dockey
+        WHERE so.docdate >= CURRENT_DATE - INTERVAL '3 months'
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) LIKE 'DONE%'
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND NOT UPPER(COALESCE(so.docref4, '')) LIKE '%INVOICED%'
+          AND sol.itemcode IS NOT NULL
+          AND (sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) > 0
+        GROUP BY sol.itemcode
+      )
+      SELECT p.itemcode, p.pending_qty, p.order_count,
+             CASE WHEN bh.id IS NOT NULL THEN true ELSE false END AS has_bom,
+             COALESCE(si.balsqty::numeric, 0) AS stock
+      FROM pending p
+      LEFT JOIN occ_bom_headers bh ON bh.finished_code = p.itemcode
+      LEFT JOIN sql_stockitems si ON si.code = p.itemcode
+    `);
+
+    let ready = 0, shortage = 0, noBom = 0;
+    for (const r of readinessRes.rows) {
+      if (!r.has_bom) { noBom++; }
+      else if (Number(r.stock) >= Number(r.pending_qty)) { ready++; }
+      else { shortage++; }
+    }
+
+    // 4. MoM production comparison data for AI brief
+    const momRes = await q(`
+      WITH curr AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name,
+               SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_so_lines sol JOIN sql_salesorders so ON so.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE)
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      ),
+      prev AS (
+        SELECT sol.itemcode, MAX(sol.description) AS name,
+               SUM(sol.qty::numeric) AS qty, SUM(sol.amount::numeric) AS revenue
+        FROM sql_so_lines sol JOIN sql_salesorders so ON so.dockey = sol.dockey
+        WHERE DATE_TRUNC('month', so.docdate::date) = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND sol.itemcode IS NOT NULL
+        GROUP BY sol.itemcode
+      )
+      SELECT COALESCE(c.itemcode, p.itemcode) AS code,
+             COALESCE(c.name, p.name) AS name,
+             COALESCE(p.qty, 0) AS prev_qty, COALESCE(c.qty, 0) AS curr_qty,
+             COALESCE(p.revenue, 0) AS prev_rev, COALESCE(c.revenue, 0) AS curr_rev
+      FROM curr c FULL OUTER JOIN prev p ON p.itemcode = c.itemcode
+      ORDER BY COALESCE(c.revenue, 0) DESC
+    `);
+
+    return res.status(200).json({
+      stock: {
+        items: stockItems,
+        totalValue: Math.round(totalStockValue * 100) / 100,
+        totalItems,
+        zeroStock,
+        negativeStock,
+      },
+      priceTrends: priceTrends.slice(0, 30),
+      priceAlerts,
+      readiness: { ready, shortage, noBom, total: ready + shortage + noBom },
+      momProducts: momRes.rows.map(r => ({
+        code: r.code, name: r.name,
+        prevQty: Number(r.prev_qty), currQty: Number(r.curr_qty),
+        prevRev: Number(r.prev_rev), currRev: Number(r.curr_rev),
+      })),
+      source: 'postgres',
+    });
+  } catch (e) {
+    console.error('production_overview error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
 
 // Production Order Queue — active SOs grouped by customer with line items
 async function handleProductionQueue(req, res) {
