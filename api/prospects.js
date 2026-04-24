@@ -332,6 +332,7 @@ export default async function handler(req, res) {
       'overview', 'ar_overview', 'customers', 'so_lifecycle',
       'pipeline', 'analytics', 'comparison', 'comparison_detail', 'comparison_brief', 'top_products',
       'document_tracker',
+      'production_queue', 'production_gap', 'production_purchase',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -1741,6 +1742,12 @@ export async function handleV2Type(req, res, type) {
       return handleTopProducts(req, res);
     case 'document_tracker':
       return handleDocumentTracker(req, res);
+    case 'production_queue':
+      return handleProductionQueue(req, res);
+    case 'production_gap':
+      return handleProductionGap(req, res);
+    case 'production_purchase':
+      return handleProductionPurchase(req, res);
     default:
       return null; // not a v2 type
   }
@@ -1875,6 +1882,300 @@ async function handleDocumentTracker(req, res) {
     return res.status(200).json({ entries, stats, source: 'postgres' });
   } catch (e) {
     console.error('document_tracker error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// PRODUCTION MODULE — Order Queue, Gap Analysis, Purchase List
+// Uses: sql_salesorders + sql_so_lines (active SOs)
+//       occ_bom_headers + occ_bom_lines (BOM explosion)
+//       sql_stockitems (current stock balances)
+// ══════════════════════════════════════════════════════════════
+
+// Production Order Queue — active SOs grouped by customer with line items
+async function handleProductionQueue(req, res) {
+  try {
+    // Get all active SOs (not DONE, not CANCELLED) with their line items
+    const r = await q(`
+      SELECT so.dockey, so.docno, so.docdate::text AS date, so.code AS customer_code,
+             so.companyname AS customer, so.docamt::numeric AS amount,
+             so.docref1 AS po_ref, so.docref2 AS delivery_info, so.docref3,
+             sol.itemcode, sol.description, sol.qty::numeric AS qty,
+             COALESCE(sol.offsetqty::numeric, 0) AS delivered_qty,
+             sol.uom, sol.unitprice::numeric AS unitprice
+      FROM sql_salesorders so
+      LEFT JOIN sql_so_lines sol ON sol.dockey = so.dockey
+      WHERE so.docdate >= CURRENT_DATE - INTERVAL '3 months'
+        AND (so.cancelled = false OR so.cancelled IS NULL)
+        AND NOT UPPER(COALESCE(so.docref3, '')) LIKE 'DONE%'
+        AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+        AND NOT UPPER(COALESCE(so.docref4, '')) LIKE '%INVOICED%'
+      ORDER BY so.docdate ASC, so.dockey
+    `);
+
+    // Group by SO, then by customer
+    const soMap = {};
+    for (const row of r.rows) {
+      if (!soMap[row.dockey]) {
+        soMap[row.dockey] = {
+          dockey: row.dockey, docno: row.docno, date: row.date,
+          customerCode: row.customer_code, customer: row.customer,
+          amount: Number(row.amount || 0), poRef: row.po_ref,
+          deliveryInfo: row.delivery_info,
+          items: [],
+        };
+      }
+      if (row.itemcode) {
+        const qty = Number(row.qty || 0);
+        const delivered = Number(row.delivered_qty || 0);
+        const pending = qty - delivered;
+        if (pending > 0) {
+          soMap[row.dockey].items.push({
+            itemcode: row.itemcode, description: row.description,
+            qty, delivered, pending, uom: row.uom,
+            unitprice: Number(row.unitprice || 0),
+          });
+        }
+      }
+    }
+
+    // Group SOs by customer
+    const customerMap = {};
+    for (const so of Object.values(soMap)) {
+      if (so.items.length === 0) continue; // skip SOs with no pending items
+      const key = so.customerCode || so.customer;
+      if (!customerMap[key]) {
+        customerMap[key] = { code: so.customerCode, name: so.customer, orders: [], totalAmount: 0 };
+      }
+      customerMap[key].orders.push(so);
+      customerMap[key].totalAmount += so.amount;
+    }
+
+    const customers = Object.values(customerMap).sort((a, b) => {
+      // Sort by earliest delivery date
+      const aDate = Math.min(...a.orders.map(o => new Date(o.date).getTime()));
+      const bDate = Math.min(...b.orders.map(o => new Date(o.date).getTime()));
+      return aDate - bDate;
+    });
+
+    // Aggregate all pending items across all SOs
+    const itemTotals = {};
+    for (const c of customers) {
+      for (const so of c.orders) {
+        for (const item of so.items) {
+          if (!itemTotals[item.itemcode]) {
+            itemTotals[item.itemcode] = { itemcode: item.itemcode, description: item.description, uom: item.uom, totalPending: 0, orderCount: 0 };
+          }
+          itemTotals[item.itemcode].totalPending += item.pending;
+          itemTotals[item.itemcode].orderCount++;
+        }
+      }
+    }
+
+    const stats = {
+      totalCustomers: customers.length,
+      totalOrders: customers.reduce((s, c) => s + c.orders.length, 0),
+      totalItems: Object.keys(itemTotals).length,
+      totalValue: customers.reduce((s, c) => s + c.totalAmount, 0),
+    };
+
+    return res.status(200).json({
+      customers,
+      itemSummary: Object.values(itemTotals).sort((a, b) => b.totalPending - a.totalPending),
+      stats,
+      source: 'postgres',
+    });
+  } catch (e) {
+    console.error('production_queue error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Production Gap Analysis — BOM explosion + stock check
+async function handleProductionGap(req, res) {
+  try {
+    // 1. Get all pending items from active SOs (same as queue but just item totals)
+    const pendingRes = await q(`
+      SELECT sol.itemcode, sol.description, sol.uom,
+             SUM(sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) AS pending_qty
+      FROM sql_salesorders so
+      JOIN sql_so_lines sol ON sol.dockey = so.dockey
+      WHERE so.docdate >= CURRENT_DATE - INTERVAL '3 months'
+        AND (so.cancelled = false OR so.cancelled IS NULL)
+        AND NOT UPPER(COALESCE(so.docref3, '')) LIKE 'DONE%'
+        AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+        AND NOT UPPER(COALESCE(so.docref4, '')) LIKE '%INVOICED%'
+        AND sol.itemcode IS NOT NULL
+        AND (sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) > 0
+      GROUP BY sol.itemcode, sol.description, sol.uom
+      ORDER BY pending_qty DESC
+    `);
+
+    // 2. Get BOM data from Postgres
+    const bomRes = await q(`
+      SELECT bh.finished_code, bh.product_name,
+             bl.component_code, bl.component_name, bl.qty_per_unit, bl.uom AS comp_uom, bl.ref_cost
+      FROM occ_bom_headers bh
+      JOIN occ_bom_lines bl ON bl.bom_id = bh.id
+      WHERE bh.is_active = true
+      ORDER BY bh.finished_code
+    `);
+
+    // Build BOM lookup: finished_code → [components]
+    const bomLookup = {};
+    for (const row of bomRes.rows) {
+      if (!bomLookup[row.finished_code]) bomLookup[row.finished_code] = [];
+      bomLookup[row.finished_code].push({
+        code: row.component_code, name: row.component_name,
+        qtyPerUnit: Number(row.qty_per_unit), uom: row.comp_uom,
+        cost: Number(row.ref_cost || 0),
+      });
+    }
+
+    // 3. Get current stock balances
+    const stockRes = await q(`
+      SELECT code, description, COALESCE(balsqty::numeric, 0) AS balance, occ_uom AS uom
+      FROM sql_stockitems
+      WHERE code IS NOT NULL
+    `);
+    const stockLookup = {};
+    for (const row of stockRes.rows) {
+      stockLookup[row.code] = { balance: Number(row.balance), description: row.description, uom: row.uom };
+    }
+
+    // 4. Explode BOMs — for each pending finished good, calculate raw material needs
+    const rawMaterialNeeds = {};  // component_code → total qty needed
+    const finishedGoods = [];     // per-item gap analysis
+
+    for (const item of pendingRes.rows) {
+      const pending = Number(item.pending_qty);
+      const bom = bomLookup[item.itemcode];
+      const stock = stockLookup[item.itemcode];
+      const currentStock = stock?.balance || 0;
+
+      const fgEntry = {
+        itemcode: item.itemcode, description: item.description,
+        pendingQty: pending, currentStock,
+        hasBom: !!bom, status: 'unknown',
+        components: [],
+      };
+
+      if (bom) {
+        // Explode BOM — calculate raw materials needed
+        for (const comp of bom) {
+          const needed = pending * comp.qtyPerUnit;
+          const compStock = stockLookup[comp.code]?.balance || 0;
+
+          // Accumulate total raw material needs
+          if (!rawMaterialNeeds[comp.code]) {
+            rawMaterialNeeds[comp.code] = {
+              code: comp.code, name: comp.name, uom: comp.uom,
+              totalNeeded: 0, currentStock: compStock, cost: comp.cost,
+            };
+          }
+          rawMaterialNeeds[comp.code].totalNeeded += needed;
+
+          fgEntry.components.push({
+            code: comp.code, name: comp.name,
+            needed: Math.round(needed * 1000) / 1000,
+            stock: compStock, uom: comp.uom,
+            shortage: Math.max(0, needed - compStock),
+            status: compStock >= needed ? 'sufficient' : 'shortage',
+          });
+        }
+
+        // Determine overall status
+        const hasShortage = fgEntry.components.some(c => c.status === 'shortage');
+        fgEntry.status = hasShortage ? 'shortage' : 'ready';
+      } else {
+        // No BOM — check finished good stock directly
+        fgEntry.status = currentStock >= pending ? 'in_stock' : 'no_bom';
+      }
+
+      finishedGoods.push(fgEntry);
+    }
+
+    // Calculate shortages for raw materials
+    const rawMaterials = Object.values(rawMaterialNeeds).map(rm => ({
+      ...rm,
+      totalNeeded: Math.round(rm.totalNeeded * 1000) / 1000,
+      shortage: Math.max(0, Math.round((rm.totalNeeded - rm.currentStock) * 1000) / 1000),
+      status: rm.currentStock >= rm.totalNeeded ? 'sufficient' : 'shortage',
+      estimatedCost: Math.round(Math.max(0, rm.totalNeeded - rm.currentStock) * rm.cost * 100) / 100,
+    })).sort((a, b) => b.shortage - a.shortage);
+
+    const stats = {
+      totalFinishedGoods: finishedGoods.length,
+      ready: finishedGoods.filter(f => f.status === 'ready' || f.status === 'in_stock').length,
+      shortage: finishedGoods.filter(f => f.status === 'shortage').length,
+      noBom: finishedGoods.filter(f => f.status === 'no_bom').length,
+      totalRawMaterials: rawMaterials.length,
+      materialsShort: rawMaterials.filter(r => r.status === 'shortage').length,
+      totalShortageValue: rawMaterials.reduce((s, r) => s + r.estimatedCost, 0),
+    };
+
+    return res.status(200).json({ finishedGoods, rawMaterials, stats, source: 'postgres' });
+  } catch (e) {
+    console.error('production_gap error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Production Purchase List — what to buy to fill shortages
+async function handleProductionPurchase(req, res) {
+  try {
+    // Reuse gap analysis to get shortages, then enrich with supplier info
+    const gapRes = await q(`
+      WITH pending AS (
+        SELECT sol.itemcode,
+               SUM(sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) AS pending_qty
+        FROM sql_salesorders so
+        JOIN sql_so_lines sol ON sol.dockey = so.dockey
+        WHERE so.docdate >= CURRENT_DATE - INTERVAL '3 months'
+          AND (so.cancelled = false OR so.cancelled IS NULL)
+          AND NOT UPPER(COALESCE(so.docref3, '')) LIKE 'DONE%'
+          AND NOT UPPER(COALESCE(so.docref3, '')) = 'CANCELLED'
+          AND NOT UPPER(COALESCE(so.docref4, '')) LIKE '%INVOICED%'
+          AND sol.itemcode IS NOT NULL
+          AND (sol.qty::numeric - COALESCE(sol.offsetqty::numeric, 0)) > 0
+        GROUP BY sol.itemcode
+      ),
+      bom_needs AS (
+        SELECT bl.component_code, bl.component_name, bl.uom, bl.ref_cost,
+               SUM(p.pending_qty * bl.qty_per_unit) AS total_needed
+        FROM pending p
+        JOIN occ_bom_headers bh ON bh.finished_code = p.itemcode
+        JOIN occ_bom_lines bl ON bl.bom_id = bh.id
+        GROUP BY bl.component_code, bl.component_name, bl.uom, bl.ref_cost
+      )
+      SELECT bn.component_code AS code, bn.component_name AS name, bn.uom,
+             bn.total_needed, bn.ref_cost,
+             COALESCE(si.balsqty::numeric, 0) AS current_stock,
+             GREATEST(0, bn.total_needed - COALESCE(si.balsqty::numeric, 0)) AS shortage
+      FROM bom_needs bn
+      LEFT JOIN sql_stockitems si ON si.code = bn.component_code
+      WHERE bn.total_needed > COALESCE(si.balsqty::numeric, 0)
+      ORDER BY (bn.total_needed - COALESCE(si.balsqty::numeric, 0)) * bn.ref_cost DESC
+    `);
+
+    const purchaseItems = gapRes.rows.map(r => ({
+      code: r.code, name: r.name, uom: r.uom,
+      needed: Math.round(Number(r.total_needed) * 1000) / 1000,
+      stock: Number(r.current_stock),
+      shortage: Math.round(Number(r.shortage) * 1000) / 1000,
+      unitCost: Number(r.ref_cost || 0),
+      totalCost: Math.round(Number(r.shortage) * Number(r.ref_cost || 0) * 100) / 100,
+    }));
+
+    const stats = {
+      totalItems: purchaseItems.length,
+      totalCost: purchaseItems.reduce((s, p) => s + p.totalCost, 0),
+    };
+
+    return res.status(200).json({ items: purchaseItems, stats, source: 'postgres' });
+  } catch (e) {
+    console.error('production_purchase error:', e);
     return res.status(500).json({ error: e.message });
   }
 }
