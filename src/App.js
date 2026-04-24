@@ -15,6 +15,7 @@ import POIntake from "./sections/POIntake";
 import CreateDO from "./sections/CreateDO";
 import CreateInvoice from "./sections/CreateInvoice";
 import DocumentTracker from "./sections/DocumentTracker";
+import ProductionOverview from "./sections/ProductionOverview";
 import ProductionQueue from "./sections/ProductionQueue";
 import ProductionGap from "./sections/ProductionGap";
 import ProductionPurchase from "./sections/ProductionPurchase";
@@ -82,9 +83,10 @@ function renderSection(section, sub) {
   }
   // Production
   if (section === "production") {
-    if (sub === 0) return <ProductionQueue />;
-    if (sub === 1) return <ProductionGap />;
-    if (sub === 2) return <ProductionPurchase />;
+    if (sub === 0) return <ProductionOverview />;
+    if (sub === 1) return <ProductionQueue />;
+    if (sub === 2) return <ProductionGap />;
+    if (sub === 3) return <ProductionPurchase />;
     return <Placeholder title="Coming Soon" description="This production feature is under development." icon="factory" />;
   }
   // Procurement (Session 2)
