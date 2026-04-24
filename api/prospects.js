@@ -2039,8 +2039,7 @@ async function handleProductionOverview(req, res) {
     // 1. Full stock inventory with values
     const stockRes = await q(`
       SELECT si.code, si.description, si.occ_uom AS uom,
-             COALESCE(si.balsqty::numeric, 0) AS balance,
-             COALESCE(si.lastpurchaseprice::numeric, 0) AS last_purchase_price
+             COALESCE(si.balsqty::numeric, 0) AS balance
       FROM sql_stockitems si
       WHERE si.code IS NOT NULL AND si.description IS NOT NULL
       ORDER BY si.description
@@ -2054,9 +2053,20 @@ async function handleProductionOverview(req, res) {
     const bomCosts = {};
     for (const r of bomCostRes.rows) bomCosts[r.code] = Number(r.avg_cost || 0);
 
+    // Also get avg purchase price from recent purchase invoices
+    let piCosts = {};
+    try {
+      const piRes = await q(`
+        SELECT itemcode AS code, AVG(unitprice::numeric) AS avg_price
+        FROM sql_pi_lines WHERE itemcode IS NOT NULL AND unitprice IS NOT NULL
+        GROUP BY itemcode
+      `);
+      for (const r of piRes.rows) piCosts[r.code] = Number(r.avg_price || 0);
+    } catch {}
+
     const stockItems = stockRes.rows.map(r => {
       const balance = Number(r.balance);
-      const unitCost = Number(r.last_purchase_price) || bomCosts[r.code] || 0;
+      const unitCost = piCosts[r.code] || bomCosts[r.code] || 0;
       return {
         code: r.code, description: r.description, uom: r.uom,
         balance, unitCost,
