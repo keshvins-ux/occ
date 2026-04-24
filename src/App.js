@@ -15,6 +15,9 @@ import POIntake from "./sections/POIntake";
 import CreateDO from "./sections/CreateDO";
 import CreateInvoice from "./sections/CreateInvoice";
 import DocumentTracker from "./sections/DocumentTracker";
+import ProductionQueue from "./sections/ProductionQueue";
+import ProductionGap from "./sections/ProductionGap";
+import ProductionPurchase from "./sections/ProductionPurchase";
 import Placeholder from "./sections/Placeholder";
 
 function AppInner() {
@@ -77,15 +80,12 @@ function renderSection(section, sub) {
     if (sub === 3) return <DocumentTracker />;
     return <POIntake />;
   }
-  // Production (Session 2)
+  // Production
   if (section === "production") {
-    return (
-      <Placeholder
-        title="Production"
-        description="Customer-order-first queue, gap analysis, purchase list with item descriptions, machine capacity planning, and real-time Floor Display — all reading from live Postgres."
-        icon="factory"
-      />
-    );
+    if (sub === 0) return <ProductionQueue />;
+    if (sub === 1) return <ProductionGap />;
+    if (sub === 2) return <ProductionPurchase />;
+    return <Placeholder title="Coming Soon" description="This production feature is under development." icon="factory" />;
   }
   // Procurement (Session 2)
   if (section === "procurement") {
