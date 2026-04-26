@@ -2096,13 +2096,13 @@ async function handleProductionOverview(req, res) {
     const zeroStock = stockItems.filter(i => i.balance <= 0).length;
     const negativeStock = stockItems.filter(i => i.balance < 0).length;
 
-    // 2. Purchase price trends — item-level, purchase-to-purchase comparison
-    // Shows each raw material's purchase history: date, supplier, amount, and price changes
+    // 2. Purchase price trends — UNIT PRICE comparison (per KG/unit)
+    // Extracts quantity from description (e.g. "CORIANDER SEED 25KG" → 25)
+    // Calculates unit price = amount / qty, then compares unit prices across purchases
     let priceTrends = [];
     let priceAlerts = [];
 
     try {
-      // Get individual purchase transactions per item (matched via description)
       const purchaseRes = await q(`
         SELECT pil.description AS item_name,
                COALESCE(pil.matched_itemcode, pil.description) AS item_key,
@@ -2119,41 +2119,76 @@ async function handleProductionOverview(req, res) {
         ORDER BY COALESCE(pil.matched_itemcode, pil.description), pi.docdate ASC
       `);
 
-      // Group purchases by item
+      // Extract quantity from description text
+      // Patterns: "25KG", "40 KG", "1KG", "500GM", "5 X 8KG", "S.AMBANG"
+      function extractQty(desc, amount) {
+        if (!desc) return null;
+        const upper = desc.toUpperCase().trim();
+        // Match patterns like "25KG", "40KG", "1KG", "500GM"
+        const kgMatch = upper.match(/(\d+\.?\d*)\s*KG/);
+        if (kgMatch) return { qty: parseFloat(kgMatch[1]), uom: 'KG' };
+        // Match "500GM" or "500G"
+        const gmMatch = upper.match(/(\d+\.?\d*)\s*G[M]?(?:\s|$)/);
+        if (gmMatch) return { qty: parseFloat(gmMatch[1]) / 1000, uom: 'KG' }; // convert to KG
+        // Match "X UNIT" or just a number
+        const unitMatch = upper.match(/(\d+)\s*(?:UNIT|PCS|BAG|CTN|PKT|BTL)/);
+        if (unitMatch) return { qty: parseFloat(unitMatch[1]), uom: 'UNIT' };
+        return null; // can't determine quantity
+      }
+
+      // Group purchases by item and calculate unit prices
       const itemMap = {};
       for (const r of purchaseRes.rows) {
         const key = r.item_key;
-        if (!itemMap[key]) itemMap[key] = { code: r.item_key, name: r.item_name, purchases: [] };
+        const qtyInfo = extractQty(r.item_name, Number(r.amount));
+        const amount = Number(r.amount);
+        const unitPrice = qtyInfo ? Math.round((amount / qtyInfo.qty) * 100) / 100 : null;
+        const uom = qtyInfo?.uom || null;
+
+        if (!itemMap[key]) itemMap[key] = { code: r.item_key, name: r.item_name, uom, purchases: [] };
         itemMap[key].purchases.push({
           date: r.purchase_date,
           supplier: r.supplier,
-          amount: Number(r.amount),
+          amount,
+          unitPrice,
+          qty: qtyInfo?.qty || null,
           invoiceNo: r.invoice_no,
         });
       }
 
-      // Calculate price changes between purchases for each item
+      // Compare unit prices (not total amounts)
       priceTrends = Object.values(itemMap)
-        .filter(item => item.purchases.length >= 2)
+        .filter(item => item.purchases.length >= 2 && item.purchases.some(p => p.unitPrice != null))
         .map(item => {
-          const first = item.purchases[0];
-          const last = item.purchases[item.purchases.length - 1];
-          const change = last.amount - first.amount;
-          const changePct = first.amount > 0 ? Math.round((change / first.amount) * 1000) / 10 : 0;
+          // Use only purchases where we could calculate unit price
+          const withPrice = item.purchases.filter(p => p.unitPrice != null);
+          if (withPrice.length < 2) return null;
+
+          const first = withPrice[0];
+          const last = withPrice[withPrice.length - 1];
+          const change = last.unitPrice - first.unitPrice;
+          const changePct = first.unitPrice > 0 ? Math.round((change / first.unitPrice) * 1000) / 10 : 0;
+
           return {
-            code: item.code, name: item.name,
-            earliestPrice: first.amount,
+            code: item.code, name: item.name, uom: item.uom || 'KG',
+            earliestPrice: first.unitPrice,
             earliestDate: first.date,
             earliestSupplier: first.supplier,
-            latestPrice: last.amount,
+            earliestQty: first.qty,
+            latestPrice: last.unitPrice,
             latestDate: last.date,
             latestSupplier: last.supplier,
+            latestQty: last.qty,
             change: Math.round(change * 100) / 100,
             changePct,
-            purchaseCount: item.purchases.length,
-            purchases: item.purchases, // full history for drill-down
+            purchaseCount: withPrice.length,
+            purchases: withPrice.map(p => ({
+              date: p.date, supplier: p.supplier,
+              unitPrice: p.unitPrice, qty: p.qty, amount: p.amount,
+            })),
           };
         })
+        .filter(Boolean)
         .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 
       priceAlerts = priceTrends.filter(t => Math.abs(t.changePct) > 10);
