@@ -2069,13 +2069,15 @@ async function handleProductionOverview(req, res) {
     // 1. Full stock inventory with values
     const stockRes = await q(`
       SELECT si.code, si.description, si.occ_uom AS uom,
-             COALESCE(si.balsqty::numeric, 0) AS balance
+             COALESCE(si.balsqty::numeric, 0) AS balance,
+             COALESCE(si.refcost::numeric, 0) AS refcost,
+             COALESCE(si.refprice::numeric, 0) AS refprice
       FROM sql_stockitems si
       WHERE si.code IS NOT NULL AND si.description IS NOT NULL
       ORDER BY si.description
     `);
 
-    // Get BOM ref costs for stock value calculation
+    // BOM ref costs as fallback only for items where SQL Account refcost is 0
     const bomCostRes = await q(`
       SELECT bl.component_code AS code, AVG(bl.ref_cost) AS avg_cost
       FROM occ_bom_lines bl GROUP BY bl.component_code
@@ -2083,48 +2085,16 @@ async function handleProductionOverview(req, res) {
     const bomCosts = {};
     for (const r of bomCostRes.rows) bomCosts[r.code] = Number(r.avg_cost || 0);
 
-    // Also get avg purchase UNIT price from recent purchase invoices
-    // Must extract qty from description to calculate per-unit cost (amount / qty)
-    let piCosts = {};
-    try {
-      const piRes = await q(`
-        SELECT matched_itemcode AS code, description, amount::numeric AS amount
-        FROM sql_pi_lines WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0
-      `);
-      // Group by code and calculate unit prices using qty extraction
-      const codeAmounts = {};
-      for (const r of piRes.rows) {
-        const desc = String(r.description || '').toUpperCase().trim();
-        let qty = null;
-        // Extract quantity from description: "25KG", "40KG", "500GM", "1KG"
-        const kgMatch = desc.match(/(\d+\.?\d*)\s*KG/);
-        if (kgMatch) qty = parseFloat(kgMatch[1]);
-        else {
-          const gmMatch = desc.match(/(\d+\.?\d*)\s*G[M]?(?:\s|$)/);
-          if (gmMatch) qty = parseFloat(gmMatch[1]) / 1000;
-        }
-        const unitPrice = qty && qty > 0 ? Number(r.amount) / qty : null;
-        if (unitPrice != null && unitPrice > 0) {
-          if (!codeAmounts[r.code]) codeAmounts[r.code] = [];
-          codeAmounts[r.code].push(unitPrice);
-        }
-      }
-      for (const [code, prices] of Object.entries(codeAmounts)) {
-        // Use median to avoid outlier bulk orders skewing the average
-        const sorted = prices.sort((a, b) => a - b);
-        piCosts[code] = sorted[Math.floor(sorted.length / 2)];
-      }
-    } catch {}
-
     const stockItems = stockRes.rows.map(r => {
       const balance = Number(r.balance);
-      // Priority: PI per-unit cost > BOM ref cost > 0
-      const unitCost = piCosts[r.code] || bomCosts[r.code] || 0;
-      // Only calculate positive value — negative balances are data issues, not negative stock value
+      // Priority: SQL Account refcost (per-unit cost set in ERP) > BOM component cost > 0
+      const refcost = Number(r.refcost);
+      const unitCost = refcost > 0 ? refcost : (bomCosts[r.code] || 0);
       const value = balance > 0 && unitCost > 0 ? Math.round(balance * unitCost * 100) / 100 : 0;
       return {
         code: r.code, description: r.description, uom: r.uom,
         balance, unitCost: Math.round(unitCost * 100) / 100,
+        refprice: Number(r.refprice),
         value,
       };
     });
