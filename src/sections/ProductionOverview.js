@@ -170,7 +170,7 @@ export default function ProductionOverview() {
         </Card>
 
         {/* Purchase Price Trends */}
-        <Card title="Supplier Spend Trends" subtitle="6-month purchase spend by supplier">
+        <Card title="Purchase Price Trends" subtitle="Item-level price comparison across purchases">
           <div style={{ padding: "12px 24px 0", borderBottom: `1px solid ${COLORS.borderFaint}` }}>
             <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
               {[["alerts", `Alerts (${priceAlerts.length})`], ["all", `All (${priceTrends.length})`]].map(([k, l]) => (
@@ -192,36 +192,40 @@ export default function ProductionOverview() {
                 <div style={{ fontSize: 13, color: COLORS.textMuted }}>No significant price changes</div>
               </div>
             ) : (
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th style={th}>Supplier</th>
-                    <th style={{ ...th, textAlign: "right" }}>Earliest</th>
-                    <th style={{ ...th, textAlign: "right" }}>Latest</th>
-                    <th style={{ ...th, textAlign: "right" }}>Change</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(trendView === "alerts" ? priceAlerts : priceTrends).map(t => (
-                    <tr key={t.code} style={{ borderBottom: `1px solid ${COLORS.borderFaint}` }}>
-                      <td style={{ padding: "10px 16px" }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: COLORS.text }}>{t.name}</div>
-                        <div style={{ fontSize: 10, fontFamily: FONT.mono, color: COLORS.textFaint }}>{t.code}</div>
-                      </td>
-                      <td style={{ padding: "10px 16px", textAlign: "right", fontSize: 12, color: COLORS.textMuted }}>{fmt(t.earliestPrice)}</td>
-                      <td style={{ padding: "10px 16px", textAlign: "right", fontSize: 12, fontWeight: 700, color: COLORS.text }}>{fmt(t.latestPrice)}</td>
-                      <td style={{ padding: "10px 16px", textAlign: "right" }}>
-                        <Pill
-                          color={t.changePct > 10 ? COLORS.dangerDark : t.changePct > 0 ? COLORS.warningDark : COLORS.successDark}
-                          bg={t.changePct > 10 ? COLORS.dangerBg : t.changePct > 0 ? COLORS.warningBg : COLORS.successBg}
-                          size="sm">
-                          {t.changePct > 0 ? "+" : ""}{t.changePct}%
-                        </Pill>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              (trendView === "alerts" ? priceAlerts : priceTrends).map(t => (
+                <div key={t.code} style={{ padding: "12px 24px", borderBottom: `1px solid ${COLORS.borderFaint}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text }}>{t.name}</div>
+                      <div style={{ fontSize: 10, fontFamily: FONT.mono, color: COLORS.textFaint }}>{t.code} · {t.purchaseCount} purchases</div>
+                    </div>
+                    <Pill
+                      color={Math.abs(t.changePct) > 10 ? COLORS.dangerDark : t.changePct > 0 ? COLORS.warningDark : COLORS.successDark}
+                      bg={Math.abs(t.changePct) > 10 ? COLORS.dangerBg : t.changePct > 0 ? COLORS.warningBg : COLORS.successBg}
+                      size="sm">
+                      {t.changePct > 0 ? "+" : ""}{t.changePct}%
+                    </Pill>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, fontSize: 11 }}>
+                    <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>First</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.earliestPrice)}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.earliestSupplier}</div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", color: COLORS.textFaint }}>→</div>
+                    <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Latest</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.latestPrice)}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.latestSupplier}</div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center" }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: t.change > 0 ? COLORS.dangerDark : COLORS.successDark }}>
+                        {t.change > 0 ? "+" : ""}{fmt(t.change)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ))
             )}
           </div>
         </Card>
