@@ -252,6 +252,91 @@ async function syncInvLines() {
   console.log(`  [inv_lines] ${secs}s | Processed: ${missingKeys.length} | Synced: ${synced} | Errors: ${errors} | Total lines: ${after.rows[0].c}`);
 }
 
+// ── SYNC PURCHASE INVOICE (SUPPLIER) LINES ────────────────────
+async function syncPILines() {
+  const started = Date.now();
+
+  // Check if table exists
+  try {
+    await q('SELECT 1 FROM sql_pi_lines LIMIT 0');
+  } catch {
+    console.log('  [pi_lines] Table sql_pi_lines does not exist — skipping. Run create_pi_lines.sql first.');
+    return;
+  }
+
+  const missingRes = await q(`
+    SELECT pi.dockey FROM sql_purchaseinvoices pi
+    LEFT JOIN sql_pi_lines pil ON pil.dockey = pi.dockey
+    WHERE pil.dockey IS NULL
+    AND pi.docdate >= CURRENT_DATE - INTERVAL '12 months'
+  `);
+
+  const missingKeys = missingRes.rows.map(r => r.dockey);
+  console.log(`  [pi_lines] Missing: ${missingKeys.length}`);
+
+  // Load stock items for description matching
+  let stockItems = [];
+  try {
+    const siRes = await q('SELECT code, description FROM sql_stockitems WHERE code IS NOT NULL AND description IS NOT NULL');
+    stockItems = siRes.rows;
+  } catch {}
+
+  let synced = 0, errors = 0;
+  for (const dockey of missingKeys) {
+    try {
+      const detail = await fetchDetail('/supplierinvoice', dockey);
+      if (!detail || !detail.sdsdocdetail) continue;
+
+      for (const line of detail.sdsdocdetail) {
+        // Try to match description to a stock item code
+        const desc = String(line.description || '').toUpperCase().trim();
+        let matchedCode = null;
+        if (desc && stockItems.length > 0) {
+          // Exact match first
+          const exact = stockItems.find(si => si.description?.toUpperCase().trim() === desc);
+          if (exact) {
+            matchedCode = exact.code;
+          } else {
+            // Partial match — description contains stock item name or vice versa
+            const partial = stockItems.find(si => {
+              const siDesc = si.description?.toUpperCase().trim() || '';
+              return siDesc && (desc.includes(siDesc) || siDesc.includes(desc));
+            });
+            if (partial) matchedCode = partial.code;
+          }
+        }
+
+        await q(`
+          INSERT INTO sql_pi_lines (
+            dtlkey, dockey, seq, account, project, description,
+            amount, localamount, taxableamt, taxamt, localtaxamt, amountwithtax,
+            fromdtlkey, matched_itemcode
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          ON CONFLICT (dtlkey) DO UPDATE SET
+            amount=EXCLUDED.amount, description=EXCLUDED.description,
+            matched_itemcode=EXCLUDED.matched_itemcode
+        `, [
+          safeInt(line.dtlkey), dockey, safeInt(line.seq),
+          safe(line.account), safe(line.project), safe(line.description),
+          safe(line.amount), safe(line.localamount), safe(line.taxableamt),
+          safe(line.taxamt), safe(line.localtaxamt), safe(line.amountwithtax),
+          safeInt(line.fromdtlkey), matchedCode,
+        ]);
+      }
+      synced++;
+    } catch (e) {
+      errors++;
+      if (errors <= 3) console.error(`  [pi_lines] ERR dockey=${dockey}: ${e.message.slice(0, 80)}`);
+    }
+    if (synced % 20 === 0) await sleep(500);
+  }
+
+  const after = await q('SELECT COUNT(*)::int AS c FROM sql_pi_lines');
+  const matched = await q('SELECT COUNT(*)::int AS c FROM sql_pi_lines WHERE matched_itemcode IS NOT NULL');
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  console.log(`  [pi_lines] ${secs}s | Processed: ${missingKeys.length} | Synced: ${synced} | Errors: ${errors} | Total lines: ${after.rows[0].c} (${matched.rows[0].c} matched to stock items)`);
+}
+
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   const arg = process.argv[2];
@@ -269,18 +354,28 @@ async function main() {
       console.log(`  so_lines:  ${soLines.rows[0].c} lines (${soMissing.rows[0].c} SOs missing lines)`);
       console.log(`  do_lines:  ${doLines.rows[0].c} lines (${doMissing.rows[0].c} DOs missing lines)`);
       console.log(`  inv_lines: ${invLines.rows[0].c} lines (${invMissing.rows[0].c} INVs missing lines)`);
+
+      try {
+        const piLines = await q('SELECT COUNT(*)::int AS c FROM sql_pi_lines');
+        const piMissing = await q(`SELECT COUNT(*)::int AS c FROM sql_purchaseinvoices pi LEFT JOIN sql_pi_lines pil ON pil.dockey = pi.dockey WHERE pil.dockey IS NULL AND pi.docdate >= CURRENT_DATE - INTERVAL '12 months'`);
+        const piMatched = await q('SELECT COUNT(*)::int AS c FROM sql_pi_lines WHERE matched_itemcode IS NOT NULL');
+        console.log(`  pi_lines:  ${piLines.rows[0].c} lines (${piMissing.rows[0].c} PIs missing lines, ${piMatched.rows[0].c} matched to items)`);
+      } catch { console.log('  pi_lines:  table not created yet'); }
     } else if (arg === 'so_lines') {
       await syncSOLines();
     } else if (arg === 'do_lines') {
       await syncDOLines();
     } else if (arg === 'inv_lines') {
       await syncInvLines();
+    } else if (arg === 'pi_lines') {
+      await syncPILines();
     } else if (!arg) {
       await syncSOLines();
       await syncDOLines();
       await syncInvLines();
+      await syncPILines();
     } else {
-      console.log(`Usage: node sync-lines.js [so_lines|do_lines|inv_lines|status]`);
+      console.log(`Usage: node sync-lines.js [so_lines|do_lines|inv_lines|pi_lines|status]`);
     }
   } catch (e) {
     console.error('LINE SYNC FAILED:', e.message);
