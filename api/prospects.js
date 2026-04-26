@@ -1107,16 +1107,27 @@ async function handleAnalytics(req, res) {
     // Get purchase costs per item (average cost from purchase invoice lines)
     let costLookup = {};
     try {
+      // Get purchase costs from PI lines (matched to stock items) + BOM ref costs
       const costRes = await q(
-        `SELECT itemcode, AVG(unitprice::numeric) AS avg_cost
+        `SELECT matched_itemcode AS itemcode, AVG(amount::numeric) AS avg_cost
          FROM sql_pi_lines
-         WHERE itemcode IS NOT NULL AND unitprice IS NOT NULL
-         GROUP BY itemcode`
+         WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0
+         GROUP BY matched_itemcode`
       );
       for (const r of costRes.rows) {
         costLookup[r.itemcode] = Number(r.avg_cost || 0);
       }
-    } catch {} // sql_pi_lines may not exist yet
+    } catch {}
+    // Also pull BOM ref costs as fallback
+    try {
+      const bomCostRes = await q(
+        `SELECT bh.finished_code AS itemcode, bh.ref_cost AS cost
+         FROM occ_bom_headers bh WHERE bh.ref_cost > 0`
+      );
+      for (const r of bomCostRes.rows) {
+        if (!costLookup[r.itemcode]) costLookup[r.itemcode] = Number(r.cost || 0);
+      }
+    } catch {}
 
     const products = productRes.rows.map((r) => {
       const revenue = Number(r.revenue || 0);
@@ -2007,12 +2018,18 @@ IMPORTANT: Return ONLY a JSON object:
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 2000,
         system: 'You are a production analyst. Respond ONLY with a valid JSON object. No text before or after.',
         messages: [{ role: 'user', content: prompt }],
       }),
     });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      console.error('AI API error:', aiRes.status, errText.slice(0, 200));
+      return res.status(200).json({ summary: 'AI brief temporarily unavailable', brief: `API returned ${aiRes.status}. The production brief will retry on next request.`, actions: [] });
+    }
 
     const aiData = await aiRes.json();
     const aiText = aiData.content?.[0]?.text || '{}';
@@ -2057,9 +2074,9 @@ async function handleProductionOverview(req, res) {
     let piCosts = {};
     try {
       const piRes = await q(`
-        SELECT itemcode AS code, AVG(unitprice::numeric) AS avg_price
-        FROM sql_pi_lines WHERE itemcode IS NOT NULL AND unitprice IS NOT NULL
-        GROUP BY itemcode
+        SELECT matched_itemcode AS code, AVG(amount::numeric) AS avg_price
+        FROM sql_pi_lines WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0
+        GROUP BY matched_itemcode
       `);
       for (const r of piRes.rows) piCosts[r.code] = Number(r.avg_price || 0);
     } catch {}
@@ -2079,82 +2096,67 @@ async function handleProductionOverview(req, res) {
     const zeroStock = stockItems.filter(i => i.balance <= 0).length;
     const negativeStock = stockItems.filter(i => i.balance < 0).length;
 
-    // 2. Purchase price trends from supplier invoice lines (item-level)
+    // 2. Purchase price trends — item-level, purchase-to-purchase comparison
+    // Shows each raw material's purchase history: date, supplier, amount, and price changes
     let priceTrends = [];
     let priceAlerts = [];
 
     try {
-      // Try item-level trends from sql_pi_lines (matched to stock items)
-      const piTrendRes = await q(`
-        SELECT pil.matched_itemcode AS code, pil.description AS name,
-               DATE_TRUNC('month', pi.docdate::date) AS month,
-               SUM(pil.amount::numeric) AS total_amount,
-               COUNT(*)::int AS purchase_count
+      // Get individual purchase transactions per item (matched via description)
+      const purchaseRes = await q(`
+        SELECT pil.description AS item_name,
+               COALESCE(pil.matched_itemcode, pil.description) AS item_key,
+               pil.amount::numeric AS amount,
+               pi.docdate::text AS purchase_date,
+               pi.docno AS invoice_no,
+               pi.companyname AS supplier
         FROM sql_pi_lines pil
         JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
-        WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months'
+        WHERE pi.docdate >= CURRENT_DATE - INTERVAL '12 months'
           AND (pi.cancelled = false OR pi.cancelled IS NULL)
           AND pil.description IS NOT NULL
           AND pil.amount IS NOT NULL AND pil.amount::numeric > 0
-        GROUP BY COALESCE(pil.matched_itemcode, pil.description), pil.description,
-                 DATE_TRUNC('month', pi.docdate::date)
-        ORDER BY COALESCE(pil.matched_itemcode, pil.description), month
+        ORDER BY COALESCE(pil.matched_itemcode, pil.description), pi.docdate ASC
       `);
 
-      // Build per-item trend
-      const trendMap = {};
-      for (const r of piTrendRes.rows) {
-        const key = r.code || r.name;
-        if (!trendMap[key]) trendMap[key] = { code: r.code || '—', name: r.name, months: [] };
-        trendMap[key].months.push({
-          month: new Date(r.month).toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }),
-          amount: Number(r.total_amount),
-          count: r.purchase_count,
+      // Group purchases by item
+      const itemMap = {};
+      for (const r of purchaseRes.rows) {
+        const key = r.item_key;
+        if (!itemMap[key]) itemMap[key] = { code: r.item_key, name: r.item_name, purchases: [] };
+        itemMap[key].purchases.push({
+          date: r.purchase_date,
+          supplier: r.supplier,
+          amount: Number(r.amount),
+          invoiceNo: r.invoice_no,
         });
       }
 
-      priceTrends = Object.values(trendMap)
-        .filter(t => t.months.length >= 2)
-        .map(t => {
-          const earliest = t.months[0].amount;
-          const latest = t.months[t.months.length - 1].amount;
-          const change = latest - earliest;
-          const changePct = earliest > 0 ? Math.round((change / earliest) * 1000) / 10 : 0;
+      // Calculate price changes between purchases for each item
+      priceTrends = Object.values(itemMap)
+        .filter(item => item.purchases.length >= 2)
+        .map(item => {
+          const first = item.purchases[0];
+          const last = item.purchases[item.purchases.length - 1];
+          const change = last.amount - first.amount;
+          const changePct = first.amount > 0 ? Math.round((change / first.amount) * 1000) / 10 : 0;
           return {
-            code: t.code, name: t.name,
-            earliestPrice: earliest, latestPrice: latest,
-            change: Math.round(change * 100) / 100, changePct,
-            months: t.months,
+            code: item.code, name: item.name,
+            earliestPrice: first.amount,
+            earliestDate: first.date,
+            earliestSupplier: first.supplier,
+            latestPrice: last.amount,
+            latestDate: last.date,
+            latestSupplier: last.supplier,
+            change: Math.round(change * 100) / 100,
+            changePct,
+            purchaseCount: item.purchases.length,
+            purchases: item.purchases, // full history for drill-down
           };
         })
         .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 
-      priceAlerts = priceTrends.filter(t => t.changePct > 10);
-
-      // If no PI lines data, fall back to supplier-level spend
-      if (priceTrends.length === 0) {
-        const fallbackRes = await q(`
-          SELECT pi.code AS supplier_code, pi.companyname AS name,
-                 DATE_TRUNC('month', pi.docdate::date) AS month,
-                 SUM(pi.docamt::numeric) AS total_spend
-          FROM sql_purchaseinvoices pi
-          WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months'
-            AND (pi.cancelled = false OR pi.cancelled IS NULL) AND pi.code IS NOT NULL
-          GROUP BY pi.code, pi.companyname, DATE_TRUNC('month', pi.docdate::date)
-          ORDER BY pi.code, month
-        `);
-        const supplierMap = {};
-        for (const r of fallbackRes.rows) {
-          if (!supplierMap[r.supplier_code]) supplierMap[r.supplier_code] = { code: r.supplier_code, name: r.name, months: [] };
-          supplierMap[r.supplier_code].months.push({ month: new Date(r.month).toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }), amount: Number(r.total_spend) });
-        }
-        priceTrends = Object.values(supplierMap).filter(s => s.months.length >= 2).map(s => {
-          const earliest = s.months[0].amount; const latest = s.months[s.months.length - 1].amount;
-          const changePct = earliest > 0 ? Math.round(((latest - earliest) / earliest) * 1000) / 10 : 0;
-          return { code: s.code, name: s.name, earliestPrice: earliest, latestPrice: latest, changePct };
-        }).sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
-        priceAlerts = priceTrends.filter(t => t.changePct > 10);
-      }
+      priceAlerts = priceTrends.filter(t => Math.abs(t.changePct) > 10);
     } catch (e) {
       console.error('price trends error:', e.message);
     }
