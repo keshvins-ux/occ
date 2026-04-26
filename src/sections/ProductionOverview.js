@@ -170,7 +170,7 @@ export default function ProductionOverview() {
         </Card>
 
         {/* Purchase Price Trends */}
-        <Card title="Purchase Price Trends" subtitle="6-month raw material cost movement">
+        <Card title="Supplier Spend Trends" subtitle="6-month purchase spend by supplier">
           <div style={{ padding: "12px 24px 0", borderBottom: `1px solid ${COLORS.borderFaint}` }}>
             <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
               {[["alerts", `Alerts (${priceAlerts.length})`], ["all", `All (${priceTrends.length})`]].map(([k, l]) => (
@@ -195,8 +195,8 @@ export default function ProductionOverview() {
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead>
                   <tr>
-                    <th style={th}>Material</th>
-                    <th style={{ ...th, textAlign: "right" }}>Early</th>
+                    <th style={th}>Supplier</th>
+                    <th style={{ ...th, textAlign: "right" }}>Earliest</th>
                     <th style={{ ...th, textAlign: "right" }}>Latest</th>
                     <th style={{ ...th, textAlign: "right" }}>Change</th>
                   </tr>
