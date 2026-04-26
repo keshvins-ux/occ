@@ -208,15 +208,15 @@ export default function ProductionOverview() {
                   </div>
                   <div style={{ display: "flex", gap: 12, fontSize: 11 }}>
                     <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
-                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>First ({t.earliestDate?.slice(5)})</div>
-                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.earliestPrice)}/{t.uom || 'KG'}</div>
-                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.earliestSupplier}{t.earliestQty ? ` · ${t.earliestQty}${t.uom || 'KG'}` : ''}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Previous Purchase · {t.previousDate ? new Date(t.previousDate).toLocaleDateString('en-MY', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.previousPrice)}/{t.uom || 'KG'}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.previousSupplier}{t.previousQty ? ` · ${t.previousQty}${t.uom || 'KG'}` : ''}</div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", color: COLORS.textFaint }}>→</div>
                     <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
-                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Latest ({t.latestDate?.slice(5)})</div>
-                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.latestPrice)}/{t.uom || 'KG'}</div>
-                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.latestSupplier}{t.latestQty ? ` · ${t.latestQty}${t.uom || 'KG'}` : ''}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Current Purchase · {t.currentDate ? new Date(t.currentDate).toLocaleDateString('en-MY', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.currentPrice)}/{t.uom || 'KG'}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.currentSupplier}{t.currentQty ? ` · ${t.currentQty}${t.uom || 'KG'}` : ''}</div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center" }}>
                       <span style={{ fontSize: 12, fontWeight: 700, color: t.change > 0 ? COLORS.dangerDark : COLORS.successDark }}>
