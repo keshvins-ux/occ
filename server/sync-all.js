@@ -12,33 +12,33 @@
 // Crontab:
 //   */10 * * * * /opt/occ/run-sync.sh
 // ============================================================
- 
+
 const { Pool } = require('pg');
 const crypto = require('crypto');
- 
+
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://occ_user:OCCseri2026!rawang@localhost:5432/occ_erp';
 const SQL_HOST = process.env.SQL_HOST;
 const SQL_ACCESS_KEY = process.env.SQL_ACCESS_KEY;
 const SQL_SECRET_KEY = process.env.SQL_SECRET_KEY;
 const SQL_REGION = process.env.SQL_REGION || 'ap-southeast-5';
 const SQL_SERVICE = process.env.SQL_SERVICE || 'sqlaccount';
- 
+
 if (!SQL_ACCESS_KEY || !SQL_SECRET_KEY || !SQL_HOST) {
   console.error('ERROR: SQL_ACCESS_KEY, SQL_SECRET_KEY, and SQL_HOST must be set');
   process.exit(1);
 }
- 
+
 const pool = new Pool({ connectionString: DATABASE_URL, max: 5 });
 async function q(sql, params = []) {
   const client = await pool.connect();
   try { return await client.query(sql, params); }
   finally { client.release(); }
 }
- 
+
 // ── AWS4 SIGNING (exact copy from V1) ─────────────────────────
 function sign(key, msg) { return crypto.createHmac('sha256', key).update(msg).digest(); }
 function getSignatureKey(key, d, r, s) { return sign(sign(sign(sign(Buffer.from('AWS4'+key), d), r), s), 'aws4_request'); }
- 
+
 function buildHeaders(path, qs) {
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
@@ -58,7 +58,7 @@ function buildHeaders(path, qs) {
     'x-amz-date': amzDate, 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0',
   };
 }
- 
+
 async function fetchPage(endpoint, offset, limit) {
   limit = limit || 50;
   const qs = `limit=${limit}&offset=${offset}`;
@@ -71,19 +71,19 @@ async function fetchPage(endpoint, offset, limit) {
     return { blocked: false, records };
   } catch { return { blocked: false, records: [] }; }
 }
- 
+
 function safe(v) { return v == null ? null : String(v); }
 function safeDate(v) { if (!v) return null; const d = new Date(v); return isNaN(d) ? null : d.toISOString().slice(0,10); }
- 
+
 // ── TABLE DEFINITIONS ─────────────────────────────────────────
 // Each table defines:
 //   fpQuery: SQL to load existing fingerprints (fast, one query)
 //   fpKey:   function to build fingerprint from Postgres row
 //   apiKey:  function to build fingerprint from API record
 //   upsert:  function to INSERT/UPDATE one record
- 
+
 const TABLES = {
- 
+
   // ── SALES INVOICES ──────────────────────────────────────────
   // dockey = UNIQUE, docno = UNIQUE
   // Problem: different dockey can have same docno (cancelled + re-issued)
@@ -137,7 +137,7 @@ const TABLES = {
       }
     },
   },
- 
+
   // ── RECEIPT VOUCHERS ────────────────────────────────────────
   receiptvouchers: {
     endpoint: '/receiptvoucher',
@@ -161,7 +161,7 @@ const TABLES = {
       r.cancelled ?? false, r.status ?? null, r.gltransid ?? null,
     ]),
   },
- 
+
   // ── SALES ORDERS ────────────────────────────────────────────
   // No deliverydate column in this table
   salesorders: {
@@ -190,7 +190,7 @@ const TABLES = {
       safe(r.docref1), safe(r.docref2), safe(r.docref3),
     ]),
   },
- 
+
   // ── DELIVERY ORDERS ─────────────────────────────────────────
   deliveryorders: {
     endpoint: '/deliveryorder',
@@ -218,7 +218,7 @@ const TABLES = {
       safe(r.docref1), safe(r.docref2), safe(r.docref3),
     ]),
   },
- 
+
   // ── CUSTOMERS ───────────────────────────────────────────────
   // No dockey column! Primary key is code (VARCHAR)
   customers: {
@@ -243,7 +243,7 @@ const TABLES = {
       safe(r.agent), safe(r.status),
     ]),
   },
- 
+
   // ── STOCK ITEMS ─────────────────────────────────────────────
   stockitems: {
     endpoint: '/stockitem',
@@ -253,35 +253,37 @@ const TABLES = {
     apiKey: r => `${r.dockey}|${safe(r.balsqty)}|${r.isactive ?? true}`,
     upsert: async (r) => q(`
       INSERT INTO sql_stockitems (
-        dockey, code, description, stockgroup, occ_uom,
-        isactive, balsqty, reorderlevel, occ_synced_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        dockey, code, description, stockgroup, uom_code,
+        isactive, balsqty, reorderlevel, refcost, refprice, occ_synced_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       ON CONFLICT (dockey) DO UPDATE SET
         code=EXCLUDED.code, description=EXCLUDED.description,
         stockgroup=EXCLUDED.stockgroup, balsqty=EXCLUDED.balsqty,
         isactive=EXCLUDED.isactive, reorderlevel=EXCLUDED.reorderlevel,
+        refcost=EXCLUDED.refcost, refprice=EXCLUDED.refprice,
         occ_synced_at=NOW()
     `, [
       r.dockey, safe(r.code), safe(r.description), safe(r.stockgroup),
       safe(r.uom), r.isactive ?? true, safe(r.balsqty), safe(r.reorderlevel),
+      safe(r.refcost), safe(r.refprice),
     ]),
   },
 };
- 
+
 // ── SYNC ONE TABLE ────────────────────────────────────────────
 async function syncTable(name) {
   const cfg = TABLES[name];
   const started = Date.now();
- 
+
   // Step 1: Load fingerprints from Postgres
   const existing = await q(cfg.fpQuery);
   const fingerprints = new Set(existing.rows.map(cfg.fpKey));
   const pgBefore = existing.rows.length;
- 
+
   // Step 2: Fetch ALL from API
   let offset = 0, apiTotal = 0;
   const toUpsert = [];
- 
+
   while (true) {
     const { blocked, records } = await fetchPage(cfg.endpoint, offset);
     if (blocked) { console.error(`  [${name}] BLOCKED at offset ${offset}`); break; }
@@ -292,7 +294,7 @@ async function syncTable(name) {
     }
     offset += records.length;
   }
- 
+
   // Step 3: Upsert changed/new (no timeout!)
   let upserted = 0, errors = 0;
   for (const r of toUpsert) {
@@ -302,17 +304,17 @@ async function syncTable(name) {
       if (errors <= 3) console.error(`  [${name}] ERR dockey=${r.dockey||r.code}: ${e.message.slice(0, 100)}`);
     }
   }
- 
+
   const after = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   console.log(`  [${name}] ${secs}s | API: ${apiTotal} | PG: ${pgBefore}→${after.rows[0].c} | Changed: ${toUpsert.length} | Upserted: ${upserted} | Errors: ${errors}`);
 }
- 
+
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   const arg = process.argv[2];
   console.log(`\n--- OCC SYNC ${new Date().toISOString().slice(0,19)} ---`);
- 
+
   try {
     if (arg === 'status') {
       for (const [name, cfg] of Object.entries(TABLES)) {
@@ -332,5 +334,5 @@ async function main() {
     await pool.end();
   }
 }
- 
+
 main();
