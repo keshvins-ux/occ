@@ -253,7 +253,7 @@ const TABLES = {
     apiKey: r => `${r.dockey}|${safe(r.balsqty)}|${r.isactive ?? true}`,
     upsert: async (r) => q(`
       INSERT INTO sql_stockitems (
-        dockey, code, description, stockgroup, uom_code,
+        dockey, code, description, stockgroup, occ_uom,
         isactive, balsqty, reorderlevel, refcost, refprice, occ_synced_at
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       ON CONFLICT (dockey) DO UPDATE SET
@@ -261,7 +261,7 @@ const TABLES = {
         stockgroup=EXCLUDED.stockgroup, balsqty=EXCLUDED.balsqty,
         isactive=EXCLUDED.isactive, reorderlevel=EXCLUDED.reorderlevel,
         refcost=EXCLUDED.refcost, refprice=EXCLUDED.refprice,
-        occ_synced_at=NOW()
+        occ_uom=EXCLUDED.occ_uom, occ_synced_at=NOW()
     `, [
       r.dockey, safe(r.code), safe(r.description), safe(r.stockgroup),
       safe(r.uom), r.isactive ?? true, safe(r.balsqty), safe(r.reorderlevel),
