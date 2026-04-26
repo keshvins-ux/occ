@@ -2007,7 +2007,7 @@ IMPORTANT: Return ONLY a JSON object:
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-opus-4-7-20250416',
+        model: 'claude-opus-4-6',
         max_tokens: 2000,
         system: 'You are a production analyst. Respond ONLY with a valid JSON object. No text before or after.',
         messages: [{ role: 'user', content: prompt }],
@@ -2079,45 +2079,68 @@ async function handleProductionOverview(req, res) {
     const zeroStock = stockItems.filter(i => i.balance <= 0).length;
     const negativeStock = stockItems.filter(i => i.balance < 0).length;
 
-    // 2. Purchase price trends (last 6 months from purchase invoice lines)
-    const trendRes = await q(`
-      SELECT pil.itemcode, MAX(pil.description) AS name,
-             DATE_TRUNC('month', pi.docdate::date) AS month,
-             AVG(pil.unitprice::numeric) AS avg_price,
-             SUM(pil.qty::numeric) AS total_qty
-      FROM sql_pi_lines pil
-      JOIN sql_purchaseinvoices pi ON pi.dockey = pil.dockey
-      WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months'
-        AND (pi.cancelled = false OR pi.cancelled IS NULL)
-        AND pil.itemcode IS NOT NULL AND pil.unitprice IS NOT NULL
-      GROUP BY pil.itemcode, DATE_TRUNC('month', pi.docdate::date)
-      ORDER BY pil.itemcode, month
-    `);
+    // 2. Purchase price trends from purchase invoices (header level — per supplier, per month)
+    // Until PI lines are synced, we use BOM ref costs for item-level and PI headers for supplier spend
+    let priceTrends = [];
+    let priceAlerts = [];
 
-    // Build price trends per item
-    const trendMap = {};
-    for (const r of trendRes.rows) {
-      if (!trendMap[r.itemcode]) trendMap[r.itemcode] = { code: r.itemcode, name: r.name, months: [] };
-      trendMap[r.itemcode].months.push({
-        month: new Date(r.month).toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }),
-        price: Math.round(Number(r.avg_price) * 100) / 100,
-        qty: Number(r.total_qty),
-      });
+    try {
+      // Get BOM components with ref_cost as baseline
+      const bomPriceRes = await q(`
+        SELECT bl.component_code AS code, bl.component_name AS name, bl.uom,
+               bl.ref_cost AS current_cost
+        FROM occ_bom_lines bl
+        WHERE bl.ref_cost > 0
+        ORDER BY bl.ref_cost DESC
+      `);
+
+      // Get purchase invoice totals per supplier per month (spend trend)
+      const piTrendRes = await q(`
+        SELECT pi.code AS supplier_code, pi.companyname AS supplier_name,
+               DATE_TRUNC('month', pi.docdate::date) AS month,
+               SUM(pi.docamt::numeric) AS total_spend,
+               COUNT(*)::int AS invoice_count
+        FROM sql_purchaseinvoices pi
+        WHERE pi.docdate >= CURRENT_DATE - INTERVAL '6 months'
+          AND (pi.cancelled = false OR pi.cancelled IS NULL)
+          AND pi.code IS NOT NULL
+        GROUP BY pi.code, pi.companyname, DATE_TRUNC('month', pi.docdate::date)
+        ORDER BY pi.code, month
+      `);
+
+      // Build supplier spend trends
+      const supplierMap = {};
+      for (const r of piTrendRes.rows) {
+        if (!supplierMap[r.supplier_code]) {
+          supplierMap[r.supplier_code] = { code: r.supplier_code, name: r.supplier_name, months: [] };
+        }
+        supplierMap[r.supplier_code].months.push({
+          month: new Date(r.month).toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }),
+          spend: Number(r.total_spend),
+          invoices: r.invoice_count,
+        });
+      }
+
+      priceTrends = Object.values(supplierMap)
+        .filter(s => s.months.length >= 2)
+        .map(s => {
+          const earliest = s.months[0].spend;
+          const latest = s.months[s.months.length - 1].spend;
+          const change = latest - earliest;
+          const changePct = earliest > 0 ? Math.round((change / earliest) * 1000) / 10 : 0;
+          return {
+            code: s.code, name: s.name,
+            earliestPrice: earliest, latestPrice: latest,
+            change: Math.round(change * 100) / 100, changePct,
+            months: s.months,
+          };
+        })
+        .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+
+      priceAlerts = priceTrends.filter(t => t.changePct > 10);
+    } catch (e) {
+      console.error('price trends error:', e.message);
     }
-
-    // Calculate price change % for each item (latest vs earliest in 6 months)
-    const priceTrends = Object.values(trendMap).map(item => {
-      const sorted = item.months;
-      if (sorted.length < 2) return { ...item, change: 0, changePct: 0 };
-      const earliest = sorted[0].price;
-      const latest = sorted[sorted.length - 1].price;
-      const change = latest - earliest;
-      const changePct = earliest > 0 ? Math.round((change / earliest) * 1000) / 10 : 0;
-      return { ...item, latestPrice: latest, earliestPrice: earliest, change: Math.round(change * 100) / 100, changePct };
-    }).filter(t => t.months.length >= 2)
-      .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
-
-    const priceAlerts = priceTrends.filter(t => t.changePct > 10);
 
     // 3. Production readiness summary
     const readinessRes = await q(`
