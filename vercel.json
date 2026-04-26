@@ -4,6 +4,32 @@
       "maxDuration": 60
     }
   },
+  "headers": [
+    {
+      "source": "/",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/static/js/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    },
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    }
+  ],
   "crons": [
     { "path": "/api/sync-v2?table=salesinvoices", "schedule": "*/10 * * * *" },
     { "path": "/api/sync-v2?table=receiptvouchers", "schedule": "2,12,22,32,42,52 * * * *" },
