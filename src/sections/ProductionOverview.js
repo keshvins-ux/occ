@@ -208,19 +208,19 @@ export default function ProductionOverview() {
                   </div>
                   <div style={{ display: "flex", gap: 12, fontSize: 11 }}>
                     <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
-                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>First</div>
-                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.earliestPrice)}</div>
-                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.earliestSupplier}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>First ({t.earliestDate?.slice(5)})</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.earliestPrice)}/{t.uom || 'KG'}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.earliestSupplier}{t.earliestQty ? ` · ${t.earliestQty}${t.uom || 'KG'}` : ''}</div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", color: COLORS.textFaint }}>→</div>
                     <div style={{ flex: 1, padding: "6px 10px", borderRadius: RADIUS.sm, background: COLORS.surfaceAlt }}>
-                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Latest</div>
-                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.latestPrice)}</div>
-                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.latestSupplier}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 9, textTransform: "uppercase" }}>Latest ({t.latestDate?.slice(5)})</div>
+                      <div style={{ fontWeight: 700, color: COLORS.text }}>{fmt(t.latestPrice)}/{t.uom || 'KG'}</div>
+                      <div style={{ color: COLORS.textFaint, fontSize: 10 }}>{t.latestSupplier}{t.latestQty ? ` · ${t.latestQty}${t.uom || 'KG'}` : ''}</div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center" }}>
                       <span style={{ fontSize: 12, fontWeight: 700, color: t.change > 0 ? COLORS.dangerDark : COLORS.successDark }}>
-                        {t.change > 0 ? "+" : ""}{fmt(t.change)}
+                        {t.change > 0 ? "+" : ""}{fmt(t.change)}/{t.uom || 'KG'}
                       </span>
                     </div>
                   </div>
