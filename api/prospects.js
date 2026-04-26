@@ -1107,15 +1107,28 @@ async function handleAnalytics(req, res) {
     // Get purchase costs per item (average cost from purchase invoice lines)
     let costLookup = {};
     try {
-      // Get purchase costs from PI lines (matched to stock items) + BOM ref costs
+      // Get purchase costs from PI lines — extract qty from description to get per-unit cost
       const costRes = await q(
-        `SELECT matched_itemcode AS itemcode, AVG(amount::numeric) AS avg_cost
+        `SELECT matched_itemcode AS itemcode, description, amount::numeric AS amount
          FROM sql_pi_lines
-         WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0
-         GROUP BY matched_itemcode`
+         WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0`
       );
+      const codePrices = {};
       for (const r of costRes.rows) {
-        costLookup[r.itemcode] = Number(r.avg_cost || 0);
+        const desc = String(r.description || '').toUpperCase().trim();
+        let qty = null;
+        const kgMatch = desc.match(/(\d+\.?\d*)\s*KG/);
+        if (kgMatch) qty = parseFloat(kgMatch[1]);
+        else { const gmMatch = desc.match(/(\d+\.?\d*)\s*G[M]?(?:\s|$)/); if (gmMatch) qty = parseFloat(gmMatch[1]) / 1000; }
+        const unitPrice = qty && qty > 0 ? Number(r.amount) / qty : null;
+        if (unitPrice != null && unitPrice > 0) {
+          if (!codePrices[r.itemcode]) codePrices[r.itemcode] = [];
+          codePrices[r.itemcode].push(unitPrice);
+        }
+      }
+      for (const [code, prices] of Object.entries(codePrices)) {
+        const sorted = prices.sort((a, b) => a - b);
+        costLookup[code] = sorted[Math.floor(sorted.length / 2)]; // median
       }
     } catch {}
     // Also pull BOM ref costs as fallback
@@ -2070,24 +2083,49 @@ async function handleProductionOverview(req, res) {
     const bomCosts = {};
     for (const r of bomCostRes.rows) bomCosts[r.code] = Number(r.avg_cost || 0);
 
-    // Also get avg purchase price from recent purchase invoices
+    // Also get avg purchase UNIT price from recent purchase invoices
+    // Must extract qty from description to calculate per-unit cost (amount / qty)
     let piCosts = {};
     try {
       const piRes = await q(`
-        SELECT matched_itemcode AS code, AVG(amount::numeric) AS avg_price
+        SELECT matched_itemcode AS code, description, amount::numeric AS amount
         FROM sql_pi_lines WHERE matched_itemcode IS NOT NULL AND amount IS NOT NULL AND amount::numeric > 0
-        GROUP BY matched_itemcode
       `);
-      for (const r of piRes.rows) piCosts[r.code] = Number(r.avg_price || 0);
+      // Group by code and calculate unit prices using qty extraction
+      const codeAmounts = {};
+      for (const r of piRes.rows) {
+        const desc = String(r.description || '').toUpperCase().trim();
+        let qty = null;
+        // Extract quantity from description: "25KG", "40KG", "500GM", "1KG"
+        const kgMatch = desc.match(/(\d+\.?\d*)\s*KG/);
+        if (kgMatch) qty = parseFloat(kgMatch[1]);
+        else {
+          const gmMatch = desc.match(/(\d+\.?\d*)\s*G[M]?(?:\s|$)/);
+          if (gmMatch) qty = parseFloat(gmMatch[1]) / 1000;
+        }
+        const unitPrice = qty && qty > 0 ? Number(r.amount) / qty : null;
+        if (unitPrice != null && unitPrice > 0) {
+          if (!codeAmounts[r.code]) codeAmounts[r.code] = [];
+          codeAmounts[r.code].push(unitPrice);
+        }
+      }
+      for (const [code, prices] of Object.entries(codeAmounts)) {
+        // Use median to avoid outlier bulk orders skewing the average
+        const sorted = prices.sort((a, b) => a - b);
+        piCosts[code] = sorted[Math.floor(sorted.length / 2)];
+      }
     } catch {}
 
     const stockItems = stockRes.rows.map(r => {
       const balance = Number(r.balance);
+      // Priority: PI per-unit cost > BOM ref cost > 0
       const unitCost = piCosts[r.code] || bomCosts[r.code] || 0;
+      // Only calculate positive value — negative balances are data issues, not negative stock value
+      const value = balance > 0 && unitCost > 0 ? Math.round(balance * unitCost * 100) / 100 : 0;
       return {
         code: r.code, description: r.description, uom: r.uom,
-        balance, unitCost,
-        value: Math.round(balance * unitCost * 100) / 100,
+        balance, unitCost: Math.round(unitCost * 100) / 100,
+        value,
       };
     });
 
@@ -2156,33 +2194,43 @@ async function handleProductionOverview(req, res) {
         });
       }
 
-      // Compare unit prices (not total amounts)
+      // Compare the LAST 2 PURCHASES of each item at similar quantities
+      // This answers: "Did we pay more or less than last time for the same thing?"
       priceTrends = Object.values(itemMap)
         .filter(item => item.purchases.length >= 2 && item.purchases.some(p => p.unitPrice != null))
         .map(item => {
-          // Use only purchases where we could calculate unit price
           const withPrice = item.purchases.filter(p => p.unitPrice != null);
           if (withPrice.length < 2) return null;
 
-          const first = withPrice[0];
-          const last = withPrice[withPrice.length - 1];
-          const change = last.unitPrice - first.unitPrice;
-          const changePct = first.unitPrice > 0 ? Math.round((change / first.unitPrice) * 1000) / 10 : 0;
+          // Remove outliers: if a purchase amount is >3x the median, it's a different order size
+          const amounts = withPrice.map(p => p.amount).sort((a, b) => a - b);
+          const median = amounts[Math.floor(amounts.length / 2)];
+          const filtered = withPrice.filter(p => p.amount <= median * 3 && p.amount >= median / 3);
+          if (filtered.length < 2) return null;
+
+          // Compare the LAST 2 purchases (most recent comparison)
+          const previous = filtered[filtered.length - 2];
+          const current = filtered[filtered.length - 1];
+          const change = current.unitPrice - previous.unitPrice;
+          const changePct = previous.unitPrice > 0 ? Math.round((change / previous.unitPrice) * 1000) / 10 : 0;
+
+          // Skip if change is negligible (< RM 0.50/unit)
+          if (Math.abs(change) < 0.5) return null;
 
           return {
             code: item.code, name: item.name, uom: item.uom || 'KG',
-            earliestPrice: first.unitPrice,
-            earliestDate: first.date,
-            earliestSupplier: first.supplier,
-            earliestQty: first.qty,
-            latestPrice: last.unitPrice,
-            latestDate: last.date,
-            latestSupplier: last.supplier,
-            latestQty: last.qty,
+            previousPrice: previous.unitPrice,
+            previousDate: previous.date,
+            previousSupplier: previous.supplier,
+            previousQty: previous.qty,
+            currentPrice: current.unitPrice,
+            currentDate: current.date,
+            currentSupplier: current.supplier,
+            currentQty: current.qty,
             change: Math.round(change * 100) / 100,
             changePct,
-            purchaseCount: withPrice.length,
-            purchases: withPrice.map(p => ({
+            purchaseCount: filtered.length,
+            purchases: filtered.map(p => ({
               date: p.date, supplier: p.supplier,
               unitPrice: p.unitPrice, qty: p.qty, amount: p.amount,
             })),
