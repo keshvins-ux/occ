@@ -333,6 +333,7 @@ export default async function handler(req, res) {
       'pipeline', 'analytics', 'comparison', 'comparison_detail', 'comparison_brief', 'top_products',
       'document_tracker',
       'production_overview', 'production_brief', 'production_queue', 'production_gap', 'production_purchase',
+      'customer_outlets',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -1776,6 +1777,8 @@ export async function handleV2Type(req, res, type) {
       return handleProductionGap(req, res);
     case 'production_purchase':
       return handleProductionPurchase(req, res);
+    case 'customer_outlets':
+      return handleCustomerOutlets(req, res);
     default:
       return null; // not a v2 type
   }
@@ -2582,6 +2585,33 @@ async function handleProductionPurchase(req, res) {
     return res.status(200).json({ items: purchaseItems, stats, source: 'postgres' });
   } catch (e) {
     console.error('production_purchase error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Customer Outlets — find all branches/outlets for a customer by name
+async function handleCustomerOutlets(req, res) {
+  try {
+    const name = req.query?.name;
+    if (!name) return res.status(400).json({ error: 'name parameter required' });
+
+    // Find all customer entries matching the name (fuzzy match)
+    const r = await q(`
+      SELECT code, companyname, companyname2
+      FROM sql_customers
+      WHERE UPPER(companyname) LIKE UPPER($1)
+      ORDER BY code
+    `, [`%${name}%`]);
+
+    const outlets = r.rows.map(row => ({
+      code: row.code,
+      name: row.companyname,
+      outlet: row.companyname2 || null,
+    }));
+
+    return res.status(200).json({ outlets, source: 'postgres' });
+  } catch (e) {
+    console.error('customer_outlets error:', e);
     return res.status(500).json({ error: e.message });
   }
 }
