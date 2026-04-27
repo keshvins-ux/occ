@@ -320,8 +320,17 @@ async function syncStockAnalysis() {
   let offset = 0, updated = 0, errors = 0, total = 0;
 
   while (true) {
-    const { blocked, records } = await fetchPage('/stockanalysis', offset);
-    if (blocked) { console.error('  [stockanalysis] BLOCKED at offset ' + offset); break; }
+    // stockanalysis returns data in 'main' key, not 'data'
+    const limit = 50;
+    const qs = `limit=${limit}&offset=${offset}`;
+    const resp = await fetch(`${SQL_HOST}/stockanalysis?${qs}`, { headers: buildHeaders('/stockanalysis', qs) });
+    const text = await resp.text();
+    let records = [];
+    try {
+      const json = JSON.parse(text);
+      records = json.main || json.data || [];
+      if (!Array.isArray(records)) records = [records];
+    } catch { break; }
     if (!records.length) break;
     total += records.length;
 
