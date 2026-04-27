@@ -297,6 +297,30 @@ export default async function handler(req, res) {
 
       // VALIDATION 1: All line items must have unitprice > 0
       const zeroPrice = lines.filter(l => !l.unitprice || parseFloat(l.unitprice) === 0);
+
+      // UOM FIX: Look up each item's actual UOM from sql_stockitems
+      // SQL Account rejects UOMs that don't match the stock item's configured UOM
+      try {
+        const itemCodes = lines.map(l => l.itemcode).filter(Boolean);
+        if (itemCodes.length > 0) {
+          const uomRes = await pgQuery(
+            `SELECT code, occ_uom FROM sql_stockitems WHERE code = ANY($1)`,
+            [itemCodes]
+          );
+          const uomMap = {};
+          for (const r of uomRes.rows) {
+            if (r.occ_uom) uomMap[r.code] = r.occ_uom;
+          }
+          // Override line UOMs with the stock item's actual UOM
+          for (const line of lines) {
+            if (line.itemcode && uomMap[line.itemcode]) {
+              line.uom = uomMap[line.itemcode];
+            }
+          }
+        }
+      } catch (e) {
+        console.error('UOM lookup error (non-fatal):', e.message);
+      }
       if (zeroPrice.length > 0) {
         return res.status(400).json({
           error: `${zeroPrice.length} line item(s) have zero unit price. Please review before submitting.`,

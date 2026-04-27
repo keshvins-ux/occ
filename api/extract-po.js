@@ -69,7 +69,17 @@ CRITICAL RULES:
    - Apply the MOST RECENT unit price for each product
    - Set unitprice_source to "from_so" with the SO number and date
 7. Quantities must be exact whole numbers as written on the PO.
-8. For PDF documents, provide bbox coordinates as normalised values (0-1 range).`;
+8. UOM MAPPING — The PO may use abbreviations. You MUST map them to these EXACT valid values:
+   Valid UOMs: KG, CTN, PKT, UNIT, PCS, BAG, BTL, SET, BOX, TIN
+   Common mappings: "PT" or "PKT" or "pkt" or "packet" → "PKT",
+   "TU" or "tub" or "jerry" or "jerigen" or "drum" or "pail" → "UNIT",
+   "CTN" or "carton" or "ctn" → "CTN", "KG" or "kg" or "kilo" → "KG",
+   "PCS" or "pcs" or "pieces" or "EA" or "each" → "PCS",
+   "BAG" or "bag" or "beg" → "BAG", "BTL" or "bottle" or "botol" → "BTL",
+   "BOX" or "box" or "kotak" → "BOX", "TIN" or "tin" → "TIN",
+   "SET" or "set" → "SET"
+   If uncertain, default to "UNIT". NEVER use the raw PO abbreviation — always map to the valid list above.
+9. For PDF documents, provide bbox coordinates as normalised values (0-1 range).`;
 }
 
 export default async function handler(req, res) {
@@ -305,6 +315,19 @@ function buildContextPrompt(recentSOs, stockItems, customers) {
     }
   ]
 }
+
+UOM RULES — ALWAYS map customer UOM abbreviations to these EXACT values:
+- KG, KILOGRAM, KGS → "KG"
+- CTN, CARTON, CRTN → "CTN"  
+- PKT, PACKET, PK, PT, PCK → "PKT"
+- UNIT, UNITS, UN, TU, TUB, EA, EACH, JC, JERRY CAN, CAN → "UNIT"
+- PCS, PIECE, PIECES, PC → "PCS"
+- BAG, BAGS, BG → "BAG"
+- BTL, BOTTLE, BOTTLES → "BTL"
+- BOX, BOXES, BX → "BOX"
+- SET, SETS → "SET"
+- TIN, TINS → "TIN"
+Only output one of: KG, CTN, PKT, UNIT, PCS, BAG, BTL, SET, BOX, TIN. Never output the customer's raw abbreviation.
 
 PRICING RULES:
 - If the PO shows a unit price → use it, set unitprice_source: "from_po"
