@@ -125,7 +125,11 @@ export default function POIntake() {
       const parsed = JSON.parse(text);
       // Auto-correct UOMs from customer abbreviations (PT→PKT, TU→UNIT, etc.)
       if (parsed.items) parsed.items = parsed.items.map(i => ({ ...i, uom: normalizeUOM(i.uom) }));
+      // Remove any error/warning messages the AI may have included in its response
+      if (parsed.error) delete parsed.error;
+      if (parsed.warning) delete parsed.warning;
       setExtraction(parsed);
+      setError(""); // Clear any previous error
       setMeta({ model: data.model, attempt: data.attempt, validation: data.validation, soContext: data.soContext });
 
       // Fetch customer outlets/branches if customer was identified
@@ -152,7 +156,10 @@ export default function POIntake() {
         if (resp2.ok && data2.content?.[0]?.text) {
           const parsed2 = JSON.parse(data2.content[0].text);
           if (parsed2.items) parsed2.items = parsed2.items.map(i => ({ ...i, uom: normalizeUOM(i.uom) }));
+          if (parsed2.error) delete parsed2.error;
+          if (parsed2.warning) delete parsed2.warning;
           setExtraction(parsed2);
+          setError(""); // Clear any error from first pass
           setMeta({ model: data2.model, attempt: data2.attempt, validation: data2.validation, soContext: data2.soContext });
         }
       }
