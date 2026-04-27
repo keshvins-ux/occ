@@ -39,11 +39,17 @@ async function db(sql, params = []) {
 
 const MODELS = ['claude-opus-4-6', 'claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022'];
 
-const config = require('./config');
+// Inline config for ESM compatibility (extract-po uses import/export)
+const tenantName = process.env.TENANT_NAME || 'Seri Rasa';
+const tenantLegal = process.env.TENANT_LEGAL || 'Vertical Target Services Sdn. Bhd.';
+const tenantAlias = process.env.TENANT_ALIAS || 'Mazza Spice / Rempah Emas';
+const tenantIndustry = process.env.TENANT_INDUSTRY || 'Halal OEM spice and condiment manufacturer';
+const tenantLocation = process.env.TENANT_LOCATION || 'Rawang, Selangor, Malaysia';
 
 function buildSystemPrompt() {
-  const sellerList = config.sellerNames.map(n => `"${n}"`).join(', ');
-  return `You are a purchase order extraction engine for ${config.aiContext}.
+  const sellerNames = [tenantName, tenantLegal, ...tenantAlias.split('/').map(s => s.trim())].filter(Boolean);
+  const sellerList = sellerNames.map(n => `"${n}"`).join(', ');
+  return `You are a purchase order extraction engine for ${tenantName} (also known as ${tenantAlias}), a ${tenantIndustry} in ${tenantLocation}.
 
 CRITICAL RULES:
 1. Your ENTIRE response must be a single valid JSON object. Start with { and end with }. No text before or after. No markdown. No explanations.
