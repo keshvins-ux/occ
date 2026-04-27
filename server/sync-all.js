@@ -310,6 +310,53 @@ async function syncTable(name) {
   console.log(`  [${name}] ${secs}s | API: ${apiTotal} | PG: ${pgBefore}→${after.rows[0].c} | Changed: ${toUpsert.length} | Upserted: ${upserted} | Errors: ${errors}`);
 }
 
+// ── STOCK ANALYSIS SYNC ──────────────────────────────────────
+// Pulls cost data from /stockanalysis endpoint
+// Updates sql_stockitems with balancecost and weighted_avg_cost
+async function syncStockAnalysis() {
+  const started = Date.now();
+  console.log('  [stockanalysis] Fetching cost data...');
+
+  let offset = 0, updated = 0, errors = 0, total = 0;
+
+  while (true) {
+    const { blocked, records } = await fetchPage('/stockanalysis', offset);
+    if (blocked) { console.error('  [stockanalysis] BLOCKED at offset ' + offset); break; }
+    if (!records.length) break;
+    total += records.length;
+
+    for (const r of records) {
+      if (!r.itemcode) continue;
+      const balance = parseFloat(r.balance || 0);
+      const balancecost = parseFloat(r.balancecost || 0);
+      const avgCost = balance > 0 && balancecost > 0 ? Math.round((balancecost / balance) * 10000) / 10000 : 0;
+
+      // Also extract UOM from the uom array if available
+      const uom = r.uom?.[0]?.uom || null;
+      const refcost = r.uom?.[0]?.refcost || null;
+
+      try {
+        await q(`
+          UPDATE sql_stockitems SET
+            balancecost = $2,
+            weighted_avg_cost = $3,
+            occ_uom = COALESCE(NULLIF($4, ''), occ_uom),
+            refcost = COALESCE(NULLIF($5, ''), NULLIF($6, '0'), refcost)
+          WHERE code = $1
+        `, [r.itemcode, String(balancecost), avgCost, uom, refcost, String(avgCost)]);
+        updated++;
+      } catch (e) {
+        errors++;
+        if (errors <= 3) console.error(`  [stockanalysis] ERR ${r.itemcode}: ${e.message.slice(0, 80)}`);
+      }
+    }
+    offset += records.length;
+  }
+
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  console.log(`  [stockanalysis] ${secs}s | API: ${total} | Updated: ${updated} | Errors: ${errors}`);
+}
+
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   const arg = process.argv[2];
@@ -321,12 +368,18 @@ async function main() {
         const r = await q(`SELECT COUNT(*)::int AS c FROM ${cfg.pg}`);
         console.log(`  ${name.padEnd(20)} ${r.rows[0].c} records`);
       }
+      // Show stock cost coverage
+      const costCoverage = await q(`SELECT COUNT(*)::int AS total, COUNT(CASE WHEN weighted_avg_cost > 0 THEN 1 END)::int AS with_cost FROM sql_stockitems WHERE balsqty::numeric > 0`);
+      console.log(`  stock_costs          ${costCoverage.rows[0].with_cost}/${costCoverage.rows[0].total} items with costs`);
+    } else if (arg === 'stockanalysis') {
+      await syncStockAnalysis();
     } else if (arg && TABLES[arg]) {
       await syncTable(arg);
     } else if (!arg) {
       for (const name of Object.keys(TABLES)) await syncTable(name);
+      await syncStockAnalysis();
     } else {
-      console.log(`Usage: node sync-all.js [${Object.keys(TABLES).join('|')}|status]`);
+      console.log(`Usage: node sync-all.js [${Object.keys(TABLES).join('|')}|stockanalysis|status]`);
     }
   } catch (e) {
     console.error('SYNC FAILED:', e.message);
