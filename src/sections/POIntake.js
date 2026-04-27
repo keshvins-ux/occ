@@ -34,20 +34,26 @@ function priceSourceStyle(source) {
   return { bg: COLORS.dangerBg, text: COLORS.dangerDark, label: "No price" };
 }
 
-const UOM_OPTIONS = ["KG", "CTN", "PKT", "UNIT", "PCS", "BAG", "BTL", "SET", "BOX", "TIN"];
+// Valid UOMs — sourced from actual sql_so_lines data in SQL Account (not assumed)
+const UOM_OPTIONS = ["UNIT", "CTN", "BAG", "CARTON", "KG", "PKT"];
 
 // Auto-correct common UOM abbreviations from customer POs
 const UOM_MAP = {
-  KG: "KG", KILOGRAM: "KG", KGS: "KG",
-  CTN: "CTN", CARTON: "CTN", CRTN: "CTN",
+  // KG variants
+  KG: "KG", KILOGRAM: "KG", KGS: "KG", KILO: "KG",
+  // CTN variants
+  CTN: "CTN", CRTN: "CTN",
+  // CARTON (separate UOM in SQL Account, not same as CTN)
+  CARTON: "CARTON", CARTONS: "CARTON",
+  // BAG variants
+  BAG: "BAG", BAGS: "BAG", BG: "BAG", BEG: "BAG",
+  // PKT variants
   PKT: "PKT", PACKET: "PKT", PK: "PKT", PT: "PKT", PCK: "PKT",
-  UNIT: "UNIT", UNITS: "UNIT", UN: "UNIT", TU: "UNIT", TUB: "UNIT", EA: "UNIT", EACH: "UNIT", JC: "UNIT",
-  PCS: "PCS", PIECE: "PCS", PIECES: "PCS", PC: "PCS",
-  BAG: "BAG", BAGS: "BAG", BG: "BAG",
-  BTL: "BTL", BOTTLE: "BTL", BOTTLES: "BTL",
-  BOX: "BOX", BOXES: "BOX", BX: "BOX",
-  SET: "SET", SETS: "SET",
-  TIN: "TIN", TINS: "TIN",
+  // UNIT — default for everything else
+  UNIT: "UNIT", UNITS: "UNIT", UN: "UNIT", TU: "UNIT", TUB: "UNIT",
+  EA: "UNIT", EACH: "UNIT", JC: "UNIT", PCS: "UNIT", PIECE: "UNIT",
+  PIECES: "UNIT", PC: "UNIT", BTL: "UNIT", BOTTLE: "UNIT", BOX: "UNIT",
+  SET: "UNIT", TIN: "UNIT",
 };
 function normalizeUOM(raw) {
   if (!raw) return "UNIT";
