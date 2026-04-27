@@ -2073,6 +2073,8 @@ async function handleProductionOverview(req, res) {
     const stockRes = await q(`
       SELECT si.code, si.description, si.occ_uom AS uom,
              COALESCE(si.balsqty::numeric, 0) AS balance,
+             COALESCE(si.weighted_avg_cost, 0) AS avg_cost,
+             COALESCE(si.balancecost::numeric, 0) AS balance_cost,
              COALESCE(si.refcost::numeric, 0) AS refcost,
              COALESCE(si.refprice::numeric, 0) AS refprice
       FROM sql_stockitems si
@@ -2080,7 +2082,7 @@ async function handleProductionOverview(req, res) {
       ORDER BY si.description
     `);
 
-    // BOM ref costs as fallback only for items where SQL Account refcost is 0
+    // BOM ref costs as secondary fallback
     const bomCostRes = await q(`
       SELECT bl.component_code AS code, AVG(bl.ref_cost) AS avg_cost
       FROM occ_bom_lines bl GROUP BY bl.component_code
@@ -2090,15 +2092,18 @@ async function handleProductionOverview(req, res) {
 
     const stockItems = stockRes.rows.map(r => {
       const balance = Number(r.balance);
-      // Priority: SQL Account refcost (per-unit cost set in ERP) > BOM component cost > 0
-      const refcost = Number(r.refcost);
-      const unitCost = refcost > 0 ? refcost : (bomCosts[r.code] || 0);
-      const value = balance > 0 && unitCost > 0 ? Math.round(balance * unitCost * 100) / 100 : 0;
+      const balanceCost = Number(r.balance_cost);
+      const avgCost = Number(r.avg_cost);
+      // Priority: 1) balance_cost from stockanalysis (exact)  2) weighted_avg_cost * balance  3) BOM ref cost
+      const value = balanceCost > 0 ? balanceCost :
+                    (balance > 0 && avgCost > 0 ? Math.round(balance * avgCost * 100) / 100 :
+                    (balance > 0 && bomCosts[r.code] ? Math.round(balance * bomCosts[r.code] * 100) / 100 : 0));
+      const unitCost = avgCost > 0 ? avgCost : (bomCosts[r.code] || 0);
       return {
         code: r.code, description: r.description, uom: r.uom,
         balance, unitCost: Math.round(unitCost * 100) / 100,
         refprice: Number(r.refprice),
-        value,
+        value: Math.round(value * 100) / 100,
       };
     });
 
