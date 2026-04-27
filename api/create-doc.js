@@ -298,20 +298,33 @@ export default async function handler(req, res) {
       // VALIDATION 1: All line items must have unitprice > 0
       const zeroPrice = lines.filter(l => !l.unitprice || parseFloat(l.unitprice) === 0);
 
-      // UOM FIX: Look up each item's actual UOM from sql_stockitems
-      // SQL Account rejects UOMs that don't match the stock item's configured UOM
+      // UOM FIX: Look up each item's actual UOM
+      // Priority: 1) sql_stockitems.occ_uom  2) existing SO lines (proven working)  3) keep original
       try {
         const itemCodes = lines.map(l => l.itemcode).filter(Boolean);
         if (itemCodes.length > 0) {
+          const uomMap = {};
+
+          // Try stockitems first
           const uomRes = await pgQuery(
-            `SELECT code, occ_uom FROM sql_stockitems WHERE code = ANY($1)`,
+            `SELECT code, occ_uom FROM sql_stockitems WHERE code = ANY($1) AND occ_uom IS NOT NULL AND occ_uom != ''`,
             [itemCodes]
           );
-          const uomMap = {};
-          for (const r of uomRes.rows) {
-            if (r.occ_uom) uomMap[r.code] = r.occ_uom;
+          for (const r of uomRes.rows) uomMap[r.code] = r.occ_uom;
+
+          // For items still missing UOM, check existing SO lines (these UOMs were accepted by SQL Account before)
+          const missing = itemCodes.filter(c => !uomMap[c]);
+          if (missing.length > 0) {
+            const soUomRes = await pgQuery(
+              `SELECT DISTINCT ON (itemcode) itemcode, uom FROM sql_so_lines WHERE itemcode = ANY($1) AND uom IS NOT NULL AND uom != '' ORDER BY itemcode, dockey DESC`,
+              [missing]
+            );
+            for (const r of soUomRes.rows) {
+              if (!uomMap[r.itemcode]) uomMap[r.itemcode] = r.uom;
+            }
           }
-          // Override line UOMs with the stock item's actual UOM
+
+          // Override line UOMs with proven-working values
           for (const line of lines) {
             if (line.itemcode && uomMap[line.itemcode]) {
               line.uom = uomMap[line.itemcode];
