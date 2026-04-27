@@ -36,6 +36,25 @@ function priceSourceStyle(source) {
 
 const UOM_OPTIONS = ["KG", "CTN", "PKT", "UNIT", "PCS", "BAG", "BTL", "SET", "BOX", "TIN"];
 
+// Auto-correct common UOM abbreviations from customer POs
+const UOM_MAP = {
+  KG: "KG", KILOGRAM: "KG", KGS: "KG",
+  CTN: "CTN", CARTON: "CTN", CRTN: "CTN",
+  PKT: "PKT", PACKET: "PKT", PK: "PKT", PT: "PKT", PCK: "PKT",
+  UNIT: "UNIT", UNITS: "UNIT", UN: "UNIT", TU: "UNIT", TUB: "UNIT", EA: "UNIT", EACH: "UNIT", JC: "UNIT",
+  PCS: "PCS", PIECE: "PCS", PIECES: "PCS", PC: "PCS",
+  BAG: "BAG", BAGS: "BAG", BG: "BAG",
+  BTL: "BTL", BOTTLE: "BTL", BOTTLES: "BTL",
+  BOX: "BOX", BOXES: "BOX", BX: "BOX",
+  SET: "SET", SETS: "SET",
+  TIN: "TIN", TINS: "TIN",
+};
+function normalizeUOM(raw) {
+  if (!raw) return "UNIT";
+  const upper = String(raw).toUpperCase().trim();
+  return UOM_MAP[upper] || (UOM_OPTIONS.includes(upper) ? upper : "UNIT");
+}
+
 // ── MAIN COMPONENT ──────────────────────────────────────────
 export default function POIntake() {
   const [stage, setStage] = useState("upload"); // upload | extracting | review | submitting | done | error
@@ -46,6 +65,8 @@ export default function POIntake() {
   const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState("");
   const [extraction, setExtraction] = useState(null);
+  const [outlets, setOutlets] = useState([]);
+  const [selectedOutlet, setSelectedOutlet] = useState(null);
   const [meta, setMeta] = useState(null);
   const [stockItems, setStockItems] = useState([]);
   const [soResult, setSoResult] = useState(null);
@@ -102,8 +123,27 @@ export default function POIntake() {
       if (!text) { setError("No extraction result"); setStage("upload"); return; }
 
       const parsed = JSON.parse(text);
+      // Auto-correct UOMs from customer abbreviations (PT→PKT, TU→UNIT, etc.)
+      if (parsed.items) parsed.items = parsed.items.map(i => ({ ...i, uom: normalizeUOM(i.uom) }));
       setExtraction(parsed);
       setMeta({ model: data.model, attempt: data.attempt, validation: data.validation, soContext: data.soContext });
+
+      // Fetch customer outlets/branches if customer was identified
+      if (parsed.customerName) {
+        try {
+          const outletRes = await fetch(`/api/prospects?type=customer_outlets&name=${encodeURIComponent(parsed.customerName)}`);
+          const outletData = await outletRes.json();
+          if (outletData.outlets?.length > 1) {
+            setOutlets(outletData.outlets);
+            // If extraction already matched a code, pre-select it
+            if (parsed.customerCode) {
+              setSelectedOutlet(parsed.customerCode);
+            }
+          } else {
+            setOutlets([]);
+          }
+        } catch { setOutlets([]); }
+      }
 
       // Re-extract with customer code hint for SO pricing context
       if (parsed.customerCode && !data.soContext) {
@@ -111,6 +151,7 @@ export default function POIntake() {
         const data2 = await resp2.json();
         if (resp2.ok && data2.content?.[0]?.text) {
           const parsed2 = JSON.parse(data2.content[0].text);
+          if (parsed2.items) parsed2.items = parsed2.items.map(i => ({ ...i, uom: normalizeUOM(i.uom) }));
           setExtraction(parsed2);
           setMeta({ model: data2.model, attempt: data2.attempt, validation: data2.validation, soContext: data2.soContext });
         }
@@ -147,7 +188,7 @@ export default function POIntake() {
           itemcode: item.itemcode,
           description: item.itemdescription || item.description,
           qty: Number(item.qty || 0),
-          uom: item.uom || "UNIT",
+          uom: normalizeUOM(item.uom),
           unitprice: Number(item.unitprice || 0),
           amount: Number(item.amount || 0),
           deliverydate: extraction.deliveryDate || todayStr,
@@ -370,6 +411,30 @@ export default function POIntake() {
               <FieldBlock label="PO Number" value={extraction.poNumber || "—"} confidence={extraction.poNumber_confidence} />
               <FieldBlock label="Delivery Date" value={extraction.deliveryDate || "—"} confidence={extraction.deliveryDate_confidence} />
             </div>
+            {outlets.length > 1 && (
+              <div style={{ padding: "0 24px 16px", borderTop: `1px solid ${COLORS.borderFaint}`, marginTop: 4, paddingTop: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: BRAND.accent, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+                  Select Outlet / Branch
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {outlets.map(o => (
+                    <button key={o.code} onClick={() => {
+                      setSelectedOutlet(o.code);
+                      setExtraction(prev => ({ ...prev, customerCode: o.code, customerName: o.name + (o.outlet ? ` ${o.outlet}` : '') }));
+                    }} style={{
+                      padding: "10px 16px", borderRadius: RADIUS.lg, cursor: "pointer",
+                      border: selectedOutlet === o.code ? `2px solid ${BRAND.accent}` : `1px solid ${COLORS.borderStrong}`,
+                      background: selectedOutlet === o.code ? BRAND.accentGlow : COLORS.surface,
+                      transition: "all 0.15s",
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: selectedOutlet === o.code ? BRAND.accent : COLORS.text }}>{o.name}</div>
+                      {o.outlet && <div style={{ fontSize: 11, color: selectedOutlet === o.code ? BRAND.accent : COLORS.textMuted, marginTop: 2 }}>{o.outlet}</div>}
+                      <div style={{ fontSize: 10, fontFamily: FONT.mono, color: COLORS.textFaint, marginTop: 2 }}>{o.code}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </Card>
 
           <Card title="Line Items" subtitle={`${items.length} items · click any cell to edit`}
