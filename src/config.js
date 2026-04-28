@@ -34,6 +34,16 @@ const config = {
   enableProduction:  envBool('ENABLE_PRODUCTION',   false),
   enableProcurement: envBool('ENABLE_PROCUREMENT',  false),
 
+  // ── SQL ACCOUNT DEFAULTS ────────────────────────────────────
+  // Mirrored from api/config.js. Frontend uses defaultLocation in
+  // PO Intake when creating SOs (replaces hardcoded 'SW').
+  // NOTE: env vars here only resolve at build time if prefixed with
+  // REACT_APP_. Until env var loading is unified, defaults apply.
+  sqlControlAccount: env('SQL_DEFAULT_CONTROLACCOUNT', '300-0000'),
+  sqlCurrency:       env('SQL_DEFAULT_CURRENCY',      'MYR'),
+  sqlCreditTerm:     env('SQL_DEFAULT_CREDITTERM',    '30 DAYS'),
+  defaultLocation:   env('SQL_DEFAULT_LOCATION',      'SW'),
+
   // ── DERIVED HELPERS ─────────────────────────────────────────
   // Redis key with prefix
   redisKey(name) { return `${this.redisPrefix}${name}`; },
