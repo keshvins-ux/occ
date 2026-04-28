@@ -1704,7 +1704,7 @@ IMPORTANT: Return ONLY a JSON object with this structure:
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         max_tokens: 2000,
         system: 'You are a business analyst. Respond ONLY with a valid JSON object. No text before or after.',
         messages: [{ role: 'user', content: prompt }],
@@ -1779,6 +1779,12 @@ export async function handleV2Type(req, res, type) {
       return handleProductionPurchase(req, res);
     case 'customer_outlets':
       return handleCustomerOutlets(req, res);
+    case 'stock_items':
+      return handleStockItems(req, res);
+    case 'customer_search':
+      return handleCustomerSearch(req, res);
+    case 'recent_customer_codes':
+      return handleRecentCustomerCodes(req, res);
     default:
       return null; // not a v2 type
   }
@@ -2034,7 +2040,7 @@ IMPORTANT: Return ONLY a JSON object:
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 2000,
         system: 'You are a production analyst. Respond ONLY with a valid JSON object. No text before or after.',
         messages: [{ role: 'user', content: prompt }],
@@ -2617,6 +2623,105 @@ async function handleCustomerOutlets(req, res) {
     return res.status(200).json({ outlets, source: 'postgres' });
   } catch (e) {
     console.error('customer_outlets error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Stock Items — list of active stock items for matching dropdown in PO Intake.
+// Replaces the previous /api/operations?section=stock call which never worked
+// (operations.js doesn't respond to that section param and was returning empty arrays).
+async function handleStockItems(req, res) {
+  try {
+    const r = await q(`
+      SELECT
+        code,
+        description,
+        defuom_st AS uom_code,
+        stockgroup,
+        balsqty::numeric AS balsqty
+      FROM sql_stockitems
+      WHERE code IS NOT NULL
+        AND (isactive = true OR isactive IS NULL)
+      ORDER BY code
+    `);
+
+    const items = r.rows.map(row => ({
+      code:        row.code,
+      description: row.description || '',
+      uom_code:    row.uom_code || '',
+      stockgroup:  row.stockgroup || '',
+      balsqty:     parseFloat(row.balsqty) || 0,
+    }));
+
+    return res.status(200).json({ items, count: items.length, source: 'postgres' });
+  } catch (e) {
+    console.error('stock_items error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Customer Search — fuzzy search across companyname, companyname2, and code.
+// Used by PR (B) "Find or create customer" modal. Returns up to 10 matches
+// so the salesperson can pick an existing customer before deciding to create
+// a new one. This prevents duplicate customer records — the AI's fuzzy match
+// in extract-po.js can miss obvious matches (e.g. trailing whitespace,
+// abbreviations like "Sdn Bhd" vs "Sdn. Bhd.").
+async function handleCustomerSearch(req, res) {
+  try {
+    const qStr = String(req.query?.q || '').trim();
+    if (!qStr || qStr.length < 2) {
+      return res.status(200).json({ matches: [], count: 0 });
+    }
+
+    const r = await q(`
+      SELECT code, companyname, companyname2, area, creditterm
+      FROM sql_customers
+      WHERE code IS NOT NULL
+        AND (
+          UPPER(companyname)  LIKE UPPER($1)
+          OR UPPER(companyname2) LIKE UPPER($1)
+          OR UPPER(code)         LIKE UPPER($1)
+        )
+      ORDER BY
+        CASE WHEN UPPER(companyname) = UPPER($2) THEN 0
+             WHEN UPPER(companyname) LIKE UPPER($3) THEN 1
+             ELSE 2 END,
+        companyname
+      LIMIT 10
+    `, [`%${qStr}%`, qStr, `${qStr}%`]);
+
+    const matches = r.rows.map(row => ({
+      code:       row.code,
+      name:       row.companyname,
+      outlet:     row.companyname2 || null,
+      area:       row.area || null,
+      creditterm: row.creditterm || null,
+    }));
+
+    return res.status(200).json({ matches, count: matches.length, source: 'postgres' });
+  } catch (e) {
+    console.error('customer_search error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Recent Customer Codes — used by the Create Customer modal as a hint
+// above the code input ("Recent codes used: 300-T0040, 300-S0019, ...").
+// Helps the salesperson match the team's coding convention without us
+// auto-generating the code (per Q1 design decision: manual entry).
+async function handleRecentCustomerCodes(req, res) {
+  try {
+    const r = await q(`
+      SELECT code
+      FROM sql_customers
+      WHERE code IS NOT NULL AND code != ''
+      ORDER BY synced_at DESC NULLS LAST, code DESC
+      LIMIT 5
+    `);
+    const codes = r.rows.map(row => row.code);
+    return res.status(200).json({ codes });
+  } catch (e) {
+    console.error('recent_customer_codes error:', e);
     return res.status(500).json({ error: e.message });
   }
 }
