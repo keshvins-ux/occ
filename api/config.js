@@ -33,6 +33,15 @@ const config = {
   enablePOIntake:    envBool('ENABLE_PO_INTAKE',    true),
   enableAIAssistant: envBool('ENABLE_AI_ASSISTANT', true),
 
+  // ── SQL ACCOUNT DEFAULTS ────────────────────────────────────
+  // Used when creating new SOs and when creating new customers (PR B).
+  // Each tenant should set these in their .env to match their
+  // SQL Account chart of accounts and standard terms.
+  sqlControlAccount: env('SQL_DEFAULT_CONTROLACCOUNT', '300-0000'),
+  sqlCurrency:       env('SQL_DEFAULT_CURRENCY',      'MYR'),
+  sqlCreditTerm:     env('SQL_DEFAULT_CREDITTERM',    '30 DAYS'),
+  defaultLocation:   env('SQL_DEFAULT_LOCATION',      'SW'),
+
   // ── HELPERS ─────────────────────────────────────────────────
   redisKey(name) { return `${this.redisPrefix}${name}`; },
   get fullName() { return `${this.tenantName} / ${this.tenantLegal}`; },
