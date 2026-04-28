@@ -84,6 +84,19 @@ const PATHS = {
       <path d="M5.5 21a6.5 6.5 0 0113 0" />
     </>
   ),
+  userPlus: (
+    <>
+      <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M19 8v6M22 11h-6" />
+    </>
+  ),
+  plusCircle: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 8v8M8 12h8" />
+    </>
+  ),
   logout: (
     <>
       <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4" />
