@@ -725,7 +725,315 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(400).json({ error: 'Unknown type. Use ?type=so|invoice|do|so_balance' });
+    // ── CREATE CUSTOMER ────────────────────────────────────────────────────
+    // PR (B): New customer flow. Triggered when the team can't find a match
+    // in the customer search and chooses to create the customer in SQL Account
+    // directly from PO Intake. Strict validation gate — refuses to call SQL
+    // Account unless every business-required field is present.
+    if (type === 'customer') {
+      const config = require('./config');
+      const cust = req.body || {};
+
+      // Required-field gate. Listed in one place so the frontend can mirror
+      // the same validation and avoid round-trips for obvious gaps.
+      const REQUIRED = {
+        code:           'Customer code',
+        companyname:    'Company name',
+        controlaccount: 'Control account',
+        currencycode:   'Currency',
+        creditterm:     'Credit term',
+        area:           'Area',
+        brn:            'BRN (Business Registration Number)',
+      };
+      const missing = [];
+      for (const [k, label] of Object.entries(REQUIRED)) {
+        if (!cust[k] || String(cust[k]).trim() === '') missing.push(label);
+      }
+
+      // creditterm must be one of the 5 allowed values (matches sql_customers data + e-invoicing rules)
+      const ALLOWED_TERMS = ['14 Days', '30 Days', '45 Days', '60 Days', 'C.O.D.'];
+      if (cust.creditterm && !ALLOWED_TERMS.includes(cust.creditterm)) {
+        return res.status(400).json({
+          error: `Credit term "${cust.creditterm}" not allowed. Use one of: ${ALLOWED_TERMS.join(', ')}.`,
+        });
+      }
+
+      // At least one branch with address + a contact channel.
+      const branch = cust.branch || {};
+      if (!branch.address1 || String(branch.address1).trim() === '') {
+        missing.push('Address line 1');
+      }
+      if (!branch.phone1 && !branch.mobile) {
+        missing.push('Phone or mobile');
+      }
+
+      if (missing.length > 0) {
+        return res.status(400).json({
+          error: 'Missing required fields',
+          missing,
+          action: 'All listed fields are required by SQL Account / e-invoicing rules. Please complete and resubmit.',
+        });
+      }
+
+      // Duplicate-code check — refuse if the code already exists in Postgres
+      // (which mirrors sql_customers via sync). This catches the common typo case
+      // before we even contact SQL Account.
+      try {
+        const dup = await pgQuery(
+          `SELECT code, companyname FROM sql_customers WHERE UPPER(code) = UPPER($1) LIMIT 1`,
+          [String(cust.code).trim()]
+        );
+        if (dup.rows.length > 0) {
+          return res.status(409).json({
+            duplicate: true,
+            error: `Customer code "${dup.rows[0].code}" already exists for "${dup.rows[0].companyname}". Pick a different code.`,
+            existing: { code: dup.rows[0].code, companyname: dup.rows[0].companyname },
+          });
+        }
+      } catch (e) {
+        // If Postgres is unreachable we still let SQL Account be the source of truth.
+        // It will return its own duplicate error which is bubbled up below.
+        console.warn('Customer dup pre-check failed (non-fatal):', e.message);
+      }
+
+      // Build the full Customer payload. Required fields filled from the form;
+      // every other field gets a safe default (empty string / 0 / false) so the
+      // SQL Account schema is satisfied. Schema sourced from the official Postman
+      // collection (Customer / Create Customer body).
+      const today = new Date().toISOString().slice(0, 10);
+      const customerPayload = {
+        code:                   String(cust.code).trim(),
+        controlaccount:         String(cust.controlaccount).trim(),
+        companyname:            String(cust.companyname).trim(),
+        companyname2:           cust.companyname2 ? String(cust.companyname2).trim() : '',
+        companycategory:        cust.companycategory || '',
+        area:                   String(cust.area).trim(),
+        agent:                  cust.agent || '',
+        biznature:              cust.biznature || '',
+        creditterm:             String(cust.creditterm).trim(),
+        creditlimit:            cust.creditlimit ? String(cust.creditlimit) : '0.00',
+        overduelimit:           cust.overduelimit ? String(cust.overduelimit) : '0.00',
+        statementtype:          cust.statementtype || '',
+        currencycode:           String(cust.currencycode).trim(),
+        outstanding:            '0.00',
+        allowexceedcreditlimit: cust.allowexceedcreditlimit !== false,
+        addpdctocrlimit:        cust.addpdctocrlimit !== false,
+        agingon:                cust.agingon || '',
+        pricetag:               cust.pricetag || '',
+        creationdate:           today,
+        tax:                    cust.tax || '',
+        taxexemptno:            cust.taxexemptno || '',
+        taxexpdate:             cust.taxexpdate || today,
+        brn:                    String(cust.brn).trim(),
+        brn2:                   cust.brn2 || '',
+        gstno:                  cust.gstno || '',
+        salestaxno:             cust.salestaxno || '',
+        servicetaxno:           cust.servicetaxno || '',
+        tin:                    cust.tin || '',
+        idtype:                 typeof cust.idtype === 'number' ? cust.idtype : 0,
+        idno:                   cust.idno || '',
+        tourismno:              cust.tourismno || '',
+        sic:                    cust.sic || '',
+        submissiontype:         typeof cust.submissiontype === 'number' ? cust.submissiontype : 0,
+        irbm_classification:    cust.irbm_classification || '',
+        inforequest_uuid:       '',
+        peppolid:               cust.peppolid || '',
+        businessunit:           cust.businessunit || '',
+        taxarea:                cust.taxarea || '',
+        attachments:            '',
+        remark:                 cust.remark || '',
+        note:                   cust.note || '',
+        status:                 cust.status || '',
+        lastmodified:           0,
+        dirty:                  true,
+        sdsbranch: [{
+          dtlkey:        0,
+          code:          '',
+          branchtype:    branch.branchtype || '',
+          branchname:    branch.branchname || '',
+          address1:      String(branch.address1).trim(),
+          address2:      branch.address2 || '',
+          address3:      branch.address3 || '',
+          address4:      branch.address4 || '',
+          postcode:      branch.postcode || '',
+          city:          branch.city || '',
+          state:         branch.state || '',
+          country:       branch.country || 'Malaysia',
+          geocoordinate: branch.geocoordinate || '',
+          attention:     branch.attention || '',
+          phone1:        branch.phone1 || '',
+          phone2:        branch.phone2 || '',
+          mobile:        branch.mobile || '',
+          fax1:          branch.fax1 || '',
+          fax2:          branch.fax2 || '',
+          email:         branch.email || '',
+        }],
+        sdscreditcontrol: [],
+        sdsbankacc:       [],
+        sdstariff:        [],
+      };
+
+      // POST to SQL Account. Reuses the existing AWS4 HMAC signing helper.
+      const { ok, status, data } = await postToSQL('/customer', customerPayload);
+
+      if (!ok) {
+        const errMsg = data?.error?.message || data?.error || data?.raw || `SQL Account returned ${status}`;
+        const isDup = String(errMsg).toLowerCase().includes('duplicate')
+                   || String(errMsg).toLowerCase().includes('already exist');
+        if (isDup) {
+          return res.status(409).json({
+            duplicate: true, source: 'sql',
+            error: `SQL Account rejected: ${errMsg}`,
+          });
+        }
+        return res.status(400).json({ error: errMsg });
+      }
+
+      // Success — bubble back the new customer code so the frontend can
+      // immediately use it for the SO that triggered this flow.
+      return res.status(200).json({
+        success: true,
+        code:    customerPayload.code,
+        companyname: customerPayload.companyname,
+        message: `Customer ${customerPayload.code} created. Continue with the Sales Order.`,
+        raw: data,
+      });
+    }
+
+    // ── CREATE STOCK ITEM ──────────────────────────────────────────────────
+    // PR (B): New stock item flow. Slim version per the design decision —
+    // only code, description, default UOM, isactive. SQL Account fills
+    // the rest with sane defaults.
+    if (type === 'stockitem') {
+      const it = req.body || {};
+
+      const REQUIRED = {
+        code:        'Stock code',
+        description: 'Description',
+        defuom_st:   'Default UOM',
+      };
+      const missing = [];
+      for (const [k, label] of Object.entries(REQUIRED)) {
+        if (!it[k] || String(it[k]).trim() === '') missing.push(label);
+      }
+
+      // Default UOM must be in the same six-value valid set used everywhere else.
+      const VALID_UOMS = ['UNIT', 'CTN', 'BAG', 'CARTON', 'KG', 'PKT'];
+      if (it.defuom_st && !VALID_UOMS.includes(String(it.defuom_st).toUpperCase().trim())) {
+        return res.status(400).json({
+          error: `Default UOM "${it.defuom_st}" not allowed. Use one of: ${VALID_UOMS.join(', ')}.`,
+        });
+      }
+
+      if (missing.length > 0) {
+        return res.status(400).json({ error: 'Missing required fields', missing });
+      }
+
+      // Duplicate-code check
+      try {
+        const dup = await pgQuery(
+          `SELECT code, description FROM sql_stockitems WHERE UPPER(code) = UPPER($1) LIMIT 1`,
+          [String(it.code).trim()]
+        );
+        if (dup.rows.length > 0) {
+          return res.status(409).json({
+            duplicate: true,
+            error: `Stock code "${dup.rows[0].code}" already exists for "${dup.rows[0].description}". Pick a different code.`,
+          });
+        }
+      } catch (e) {
+        console.warn('Stock dup pre-check failed (non-fatal):', e.message);
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+      const code = String(it.code).trim();
+      const uom  = String(it.defuom_st).toUpperCase().trim();
+      const stockPayload = {
+        dockey: 0,
+        code,
+        description:  String(it.description).trim(),
+        description2: it.description2 || '',
+        description3: '',
+        stockgroup:   it.stockgroup || '',
+        stockcontrol: it.stockcontrol !== false,
+        costingmethod: typeof it.costingmethod === 'number' ? it.costingmethod : 0,
+        serialnumber: false,
+        shelf:        '',
+        minqty:       '0.00',
+        maxqty:       '0.00',
+        suom:         uom,
+        reorderlevel: '0.00',
+        reorderqty:   '0.00',
+        sltax:        '',
+        phtax:        '',
+        tariff:       '',
+        irbm_classification: '',
+        stockmatrix:  '',
+        defuom_st:    uom,
+        defuom_sl:    uom,
+        defuom_ph:    uom,
+        scriptcode:   '',
+        isactive:     it.isactive !== false,
+        creationdate: today,
+        picture:      '',
+        pictureclass: '',
+        attachments:  '',
+        note:         it.note || '',
+        uom:          uom,
+        refcost:      '0.00',
+        refprice:     '0.00',
+        itemtype:     '',
+        leadtime:     0,
+        bom_leadtime: 0,
+        bom_asmcost:  '0.00',
+        balsqty:      '0.00',
+        balsuomqty:   '0.00',
+        remark1:      '',
+        remark2:      '',
+        barcode:      '',
+        lastmodified: 0,
+        dirty:        true,
+        sdsuom: [{
+          code, uom, rate: '1.00', refcost: '0.00', refprice: '0.00',
+          mincost: '0.00', maxcost: '0.00', minprice: '0.00', maxprice: '0.00', isbase: true,
+        }],
+        sdsopeningbalance:  [],
+        sdscustomerprice:   [],
+        sdssupplierprice:   [],
+        sdscategory:        [],
+        sdsbom:             [],
+        sdsaltstockitem:    [],
+        sdscustomeritem:    [],
+        sdssupplieritem:    [],
+        sdsbarcode:         [],
+      };
+
+      const { ok, status, data } = await postToSQL('/stockitem', stockPayload);
+
+      if (!ok) {
+        const errMsg = data?.error?.message || data?.error || data?.raw || `SQL Account returned ${status}`;
+        const isDup = String(errMsg).toLowerCase().includes('duplicate')
+                   || String(errMsg).toLowerCase().includes('already exist');
+        if (isDup) {
+          return res.status(409).json({
+            duplicate: true, source: 'sql',
+            error: `SQL Account rejected: ${errMsg}`,
+          });
+        }
+        return res.status(400).json({ error: errMsg });
+      }
+
+      return res.status(200).json({
+        success: true,
+        code,
+        description: stockPayload.description,
+        defuom_st: uom,
+        message: `Stock item ${code} created. Continue with the Sales Order.`,
+        raw: data,
+      });
+    }
+
+    return res.status(400).json({ error: 'Unknown type. Use ?type=so|invoice|do|so_balance|customer|stockitem' });
 
   } catch(err) {
     console.error('create-doc error:', err);
