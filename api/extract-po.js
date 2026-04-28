@@ -28,7 +28,17 @@ import { Pool } from 'pg';
 
 let _pool = null;
 function getPool() {
-  if (!_pool) _pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
+  if (!_pool) _pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 5,
+    // Fail fast if pool is starved, rather than silently waiting until
+    // Vercel kills the function at 60s. Better to return a clean 503.
+    connectionTimeoutMillis: 8000,
+    // Cap any single query at 12s. extract-po queries are small (LIMIT 500
+    // on stockitems, LIMIT 300 on customers) and should complete in <2s.
+    // 12s gives 6x headroom; anything longer means something's stuck.
+    statement_timeout: 12000,
+  });
   return _pool;
 }
 async function db(sql, params = []) {

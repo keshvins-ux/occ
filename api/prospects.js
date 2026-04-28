@@ -1303,7 +1303,7 @@ async function handleTopProducts(req, res) {
       ORDER BY revenue DESC
       LIMIT 20
       `,
-      [days]
+      df.params
     );
 
     // Purchase cost by product from purchase invoice lines (same period)
