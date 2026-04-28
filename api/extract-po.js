@@ -70,14 +70,20 @@ CRITICAL RULES:
    - Set unitprice_source to "from_so" with the SO number and date
 7. Quantities must be exact whole numbers as written on the PO.
 8. UOM MAPPING — The PO may use abbreviations. You MUST map them to these EXACT valid values:
-   Valid UOMs: KG, CTN, PKT, UNIT, PCS, BAG, BTL, SET, BOX, TIN
-   Common mappings: "PT" or "PKT" or "pkt" or "packet" → "PKT",
-   "TU" or "tub" or "jerry" or "jerigen" or "drum" or "pail" → "UNIT",
-   "CTN" or "carton" or "ctn" → "CTN", "KG" or "kg" or "kilo" → "KG",
-   "PCS" or "pcs" or "pieces" or "EA" or "each" → "PCS",
-   "BAG" or "bag" or "beg" → "BAG", "BTL" or "bottle" or "botol" → "BTL",
-   "BOX" or "box" or "kotak" → "BOX", "TIN" or "tin" → "TIN",
-   "SET" or "set" → "SET"
+   Valid UOMs (these six only): UNIT, CTN, BAG, CARTON, KG, PKT
+   Common mappings:
+   "KG" or "kg" or "kilo" or "kilogram" → "KG",
+   "CTN" or "ctn" → "CTN" (small carton/case),
+   "CARTON" or "cartons" → "CARTON" (large carton — distinct from CTN in this catalogue),
+   "BAG" or "bag" or "beg" or "BG" → "BAG",
+   "PKT" or "PT" or "pkt" or "packet" or "PCK" → "PKT",
+   "UNIT" or "UN" or "TU" or "tub" or "TUB" or "jerry" or "drum" or "pail" → "UNIT",
+   "PCS" or "pieces" or "EA" or "each" or "PC" → "UNIT",
+   "BTL" or "bottle" or "botol" → "UNIT",
+   "BOX" or "kotak" → "UNIT",
+   "TIN" or "tin" → "UNIT",
+   "SET" or "set" → "UNIT",
+   "JC" → "UNIT"
    If uncertain, default to "UNIT". NEVER use the raw PO abbreviation — always map to the valid list above.
 9. For PDF documents, provide bbox coordinates as normalised values (0-1 range).`;
 }
