@@ -129,7 +129,10 @@ export default async function handler(req, res) {
     const fullContent = [...contentBlocks, { type: 'text', text: contextPrompt }];
 
     let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Two attempts max. With max_tokens raised to 8000, single attempts succeed
+    // reliably; second attempt only helps with transient network/model failures.
+    // Three attempts × 35s = 105s, exceeds Vercel's 60s ceiling.
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const model = MODELS[Math.min(attempt, MODELS.length - 1)];
         const claudeMessages = [{
@@ -139,12 +142,24 @@ export default async function handler(req, res) {
             : fullContent,
         }];
 
-        const responseText = await callClaude(anthropicKey, model, claudeMessages);
+        const { text: responseText, stopReason } = await callClaude(anthropicKey, model, claudeMessages);
+
+        // Truncation detection — Claude hit max_tokens limit mid-response.
+        // Retrying won't help (same model, same prompt = same truncation point);
+        // return a clean error so the team knows to use Paste Text with fewer items.
+        if (stopReason === 'max_tokens') {
+          return res.status(422).json({
+            error: 'Response too large — the PO has too many line items to process in one go.',
+            suggestion: 'Try uploading a smaller portion of the PO (fewer items at a time), or use Paste Text with just the items list.',
+            stopReason,
+          });
+        }
+
         const json = extractJson(responseText);
 
         if (!json) {
           lastError = `Attempt ${attempt + 1}: Could not extract JSON`;
-          console.error(lastError, '| Start:', responseText.slice(0, 200));
+          console.error(lastError, '| stopReason:', stopReason, '| Start:', responseText.slice(0, 200));
           continue;
         }
 
@@ -186,8 +201,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(500).json({
-      error: `PO extraction failed after 3 attempts. Last: ${lastError}`,
-      suggestion: 'Try a clearer image/PDF, or check API key balance.',
+      error: `PO extraction failed after 2 attempts. Last: ${lastError}`,
+      suggestion: 'Try a clearer image/PDF, or use Paste Text with fewer items.',
     });
 
   } catch (err) {
@@ -425,8 +440,12 @@ async function callClaude(apiKey, model, messages) {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({ model, max_tokens: 4000, system: buildSystemPrompt(), messages }),
-    signal: AbortSignal.timeout(55000),
+    // 8000 max_tokens — Tarik Bistro-class POs (30+ items × bboxes × confidence
+    // fields) easily exceed 4000. Truncated responses fail JSON.parse silently.
+    body: JSON.stringify({ model, max_tokens: 8000, system: buildSystemPrompt(), messages }),
+    // 35s timeout — Claude 4.x typically responds in 15-25s. Tighter timeout
+    // means two attempts fit cleanly within Vercel's 60s function limit.
+    signal: AbortSignal.timeout(35000),
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -436,7 +455,10 @@ async function callClaude(apiKey, model, messages) {
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
   const textBlocks = (data.content || []).filter(b => b.type === 'text');
   if (!textBlocks.length) throw new Error('Claude returned no text content');
-  return textBlocks.map(b => b.text).join('\n');
+  return {
+    text: textBlocks.map(b => b.text).join('\n'),
+    stopReason: data.stop_reason || null,
+  };
 }
 
 // ── Extract JSON from response ───────────────────────────────
