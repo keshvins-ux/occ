@@ -37,7 +37,7 @@ async function db(sql, params = []) {
   finally { client.release(); }
 }
 
-const MODELS = ['claude-opus-4-6', 'claude-sonnet-4-20250514'];
+const MODELS = ['claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6'];
 
 // Inline config for ESM compatibility (extract-po uses import/export)
 const tenantName = process.env.TENANT_NAME || 'Seri Rasa';
