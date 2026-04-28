@@ -16,8 +16,12 @@ import Card from "../components/Card";
 import KpiCard from "../components/KpiCard";
 import Pill from "../components/Pill";
 import Ic from "../components/Ic";
+import CustomerPickerModal from "../components/CustomerPickerModal";
+import StockItemPickerModal from "../components/StockItemPickerModal";
 import { BRAND, COLORS, RADIUS, SHADOWS, FONT } from "../theme";
 import { fmt } from "../utils";
+import { useAuth } from "../contexts/AuthContext";
+import config from "../config";
 
 // ── Helpers ──────────────────────────────────────────────────
 function confidenceColor(score) {
@@ -63,6 +67,7 @@ function normalizeUOM(raw) {
 
 // ── MAIN COMPONENT ──────────────────────────────────────────
 export default function POIntake() {
+  const { user } = useAuth();
   const [stage, setStage] = useState("upload"); // upload | extracting | review | submitting | done | error
   const [inputMode, setInputMode] = useState("document");
   const [file, setFile] = useState(null);
@@ -76,23 +81,23 @@ export default function POIntake() {
   const [meta, setMeta] = useState(null);
   const [stockItems, setStockItems] = useState([]);
   const [soResult, setSoResult] = useState(null);
-  const [showHistory, setShowHistory] = useState(false);
-  const [history, setHistory] = useState([]);
+  // Fix #2: Confirmation modal state — shown before submit when items would be dropped
+  const [confirmDrop, setConfirmDrop] = useState(null); // { droppedItems: [], onProceed }
+  // PR (B): Find-or-create modals
+  const [customerPickerOpen, setCustomerPickerOpen] = useState(false);
+  const [stockPickerForRow, setStockPickerForRow] = useState(null); // index of row needing match, or null
   const fileRef = useRef(null);
 
-  useEffect(() => { loadStockItems(); loadHistory(); }, []);
+  useEffect(() => { loadStockItems(); }, []);
 
+  // Fix #8: Source stock items from the new v2 endpoint instead of
+  // /api/operations?section=stock which never actually responded to that
+  // section param — was silently returning [] for the entire feature lifetime,
+  // which is why the stock-item dropdown for matching items was empty.
   async function loadStockItems() {
     try {
-      const r = await fetch("/api/operations?section=stock").then(r => r.json()).catch(() => ({}));
-      setStockItems(r.items || r.stock || []);
-    } catch {}
-  }
-
-  async function loadHistory() {
-    try {
-      const r = await fetch("/api/po-memory?customer_code=__all__").then(r => r.json()).catch(() => ({}));
-      setHistory(r.examples || []);
+      const r = await fetch("/api/prospects?type=stock_items").then(r => r.json()).catch(() => ({}));
+      setStockItems(r.items || []);
     } catch {}
   }
 
@@ -184,11 +189,39 @@ export default function POIntake() {
     const zeroPrice = itemsWithCode.filter(i => !i.unitprice || Number(i.unitprice) === 0);
     if (zeroPrice.length > 0) { setError(`${zeroPrice.length} item(s) have no price. Please enter prices before submitting.`); return; }
 
+    // Fix #2: If any items are unmatched, they will be silently dropped from the SO.
+    // Show a confirmation modal listing them so the team can't miss it.
+    const droppedItems = items.filter(i => !i.itemcode);
+    if (droppedItems.length > 0) {
+      setConfirmDrop({
+        droppedItems: droppedItems.map(i => ({
+          description: i.description || "(no description)",
+          qty: i.qty ?? "—",
+          uom: i.uom || "—",
+        })),
+        onProceed: () => {
+          setConfirmDrop(null);
+          doSubmit(itemsWithCode);
+        },
+        onCancel: () => setConfirmDrop(null),
+      });
+      return;
+    }
+
+    // No items being dropped — submit straight away.
+    doSubmit(itemsWithCode);
+  }
+
+  // The actual submit work, invoked either directly or after the confirm modal.
+  async function doSubmit(itemsWithCode) {
     setStage("submitting"); setError("");
 
     try {
       const today = new Date();
       const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+      // Fix #6: who submitted this — pulled from auth context, falls back to a generic label.
+      const submittedBy = user?.name || user?.email || "OCC User";
 
       const soPayload = {
         code: extraction.customerCode,
@@ -205,7 +238,8 @@ export default function POIntake() {
           unitprice: Number(item.unitprice || 0),
           amount: Number(item.amount || 0),
           deliverydate: extraction.deliveryDate || todayStr,
-          location: "SW",
+          // Fix #11: use tenant config instead of hardcoded 'SW'.
+          location: config.defaultLocation || "SW",
           seq: (idx + 1) * 1000,
         })),
       };
@@ -217,7 +251,7 @@ export default function POIntake() {
         customerCode: extraction.customerCode,
         poNumber: extraction.poNumber,
         totalAmount,
-        submittedBy: "OCC User",
+        submittedBy,
         submittedAt: new Date().toISOString(),
         items: itemsWithCode,
       };
@@ -254,7 +288,8 @@ export default function POIntake() {
             customer_code: extraction.customerCode,
             po_number: extraction.poNumber,
             extracted: extraction,
-            confirmed_by: "OCC User",
+            // Fix #6: same source as submittedBy above.
+            confirmed_by: submittedBy,
           }),
         });
       } catch {} // non-critical
@@ -298,6 +333,50 @@ export default function POIntake() {
     setExtraction(null); setMeta(null); setError(""); setSoResult(null);
   }
 
+  // PR (B): Customer picker callback. Called when team picks an existing
+  // customer or finishes creating a new one. Updates extraction.customerCode
+  // and clears the outlet selector since the picked code is canonical.
+  function onCustomerPicked({ code, name }) {
+    setExtraction(prev => ({
+      ...prev,
+      customerCode: code,
+      customerName: name || prev.customerName,
+      customerName_confidence: 100, // user-confirmed = max confidence
+    }));
+    setOutlets([]);
+    setSelectedOutlet(code);
+    setCustomerPickerOpen(false);
+    setError("");
+  }
+
+  // PR (B): Stock item picker callback. Updates the specific row that triggered
+  // the picker. If a brand-new item was created, it's added to the in-memory
+  // stockItems list so subsequent dropdowns include it without a refetch.
+  function onStockItemPicked({ code, description, defuom_st }) {
+    if (stockPickerForRow == null) return;
+    const rowIdx = stockPickerForRow;
+
+    // Add to local stockItems if it's not already there (newly created case)
+    setStockItems(prev => {
+      if (prev.some(s => s.code === code)) return prev;
+      return [...prev, { code, description: description || "", uom_code: defuom_st || "" }];
+    });
+
+    setExtraction(prev => {
+      const items = [...prev.items];
+      items[rowIdx] = {
+        ...items[rowIdx],
+        itemcode:       code,
+        itemdescription: description || items[rowIdx].itemdescription || "",
+        // Use the new item's default UOM if the row doesn't have one set
+        uom: items[rowIdx].uom || defuom_st || "UNIT",
+      };
+      return { ...prev, items };
+    });
+
+    setStockPickerForRow(null);
+  }
+
   const items = extraction?.items || [];
   const totalAmount = items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
   const itemsWithPrice = items.filter(i => i.unitprice != null && i.unitprice > 0).length;
@@ -307,6 +386,107 @@ export default function POIntake() {
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+
+      {/* ── PR (B): Customer Picker Modal ────────────────────── */}
+      {customerPickerOpen && (
+        <CustomerPickerModal
+          prefilledName={extraction?.customerName}
+          prefilledAddress={extraction?.customerAddress || null}
+          onPick={onCustomerPicked}
+          onClose={() => setCustomerPickerOpen(false)}
+        />
+      )}
+
+      {/* ── PR (B): Stock Item Picker Modal ──────────────────── */}
+      {stockPickerForRow != null && (
+        <StockItemPickerModal
+          stockItems={stockItems}
+          prefilledDescription={extraction?.items?.[stockPickerForRow]?.description || ""}
+          onPick={onStockItemPicked}
+          onClose={() => setStockPickerForRow(null)}
+        />
+      )}
+
+      {/* ── CONFIRMATION MODAL: items being dropped (Fix #2) ─── */}
+      {confirmDrop && (
+        <div
+          onClick={confirmDrop.onCancel}
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(15, 23, 42, 0.45)", backdropFilter: "blur(4px)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: COLORS.surface, borderRadius: RADIUS.xl,
+              maxWidth: 560, width: "100%",
+              boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
+              overflow: "hidden",
+            }}
+          >
+            {/* Header */}
+            <div style={{ padding: "20px 24px", borderBottom: `1px solid ${COLORS.borderFaint}`, display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ width: 40, height: 40, borderRadius: 12, background: COLORS.warningBg, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Ic name="alert" size={20} color={COLORS.warningDark} />
+              </div>
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.text }}>
+                  {confirmDrop.droppedItems.length} item{confirmDrop.droppedItems.length === 1 ? "" : "s"} will be excluded
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.textMuted, marginTop: 2 }}>
+                  These items have no stock code matched and won't be on the Sales Order.
+                </div>
+              </div>
+            </div>
+
+            {/* Dropped items list */}
+            <div style={{ padding: "16px 24px", maxHeight: 320, overflowY: "auto" }}>
+              {confirmDrop.droppedItems.map((d, i) => (
+                <div
+                  key={i}
+                  style={{
+                    padding: "10px 14px",
+                    background: `${COLORS.dangerBg}66`,
+                    borderRadius: RADIUS.md,
+                    marginBottom: 8,
+                    borderLeft: `3px solid ${COLORS.danger}`,
+                    display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12,
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text, flex: 1 }}>
+                    {d.description}
+                  </div>
+                  <div style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: FONT.mono, whiteSpace: "nowrap" }}>
+                    {d.qty} {d.uom}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Footer note + actions */}
+            <div style={{ padding: "16px 24px", background: COLORS.surfaceAlt, borderTop: `1px solid ${COLORS.borderFaint}` }}>
+              <div style={{ fontSize: 12, color: COLORS.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
+                If the customer asked for these, go back and click the red "Click to match" pill on each row to pick the correct stock code. If we genuinely don't sell them, you can proceed without them.
+              </div>
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button onClick={confirmDrop.onCancel} style={btnSec}>
+                  Go back &amp; fix
+                </button>
+                <button
+                  onClick={confirmDrop.onProceed}
+                  style={{ ...btnPrimary, background: COLORS.warningDark }}
+                >
+                  Proceed without {confirmDrop.droppedItems.length} item{confirmDrop.droppedItems.length === 1 ? "" : "s"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: BRAND.accent, textTransform: "uppercase", letterSpacing: "0.06em", display: "flex", alignItems: "center", gap: 6 }}>
@@ -380,7 +560,7 @@ export default function POIntake() {
             <div style={{ width: 56, height: 56, borderRadius: 16, background: BRAND.accentGlow, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", animation: "pulse 2s infinite" }}>
               <Ic name="sparkle" size={24} color={BRAND.accent} />
             </div>
-            <div style={{ fontSize: 16, fontWeight: 700, color: COLORS.text, marginBottom: 8 }}>{process.env.REACT_APP_TENANT_NAME || 'Seri Rasa'} is reading your PO…</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: COLORS.text, marginBottom: 8 }}>{config.tenantName} is reading your PO…</div>
             <div style={{ fontSize: 13, color: COLORS.textMuted, maxWidth: 400, margin: "0 auto", lineHeight: 1.6 }}>Extracting customer details, matching products to stock codes, and pulling pricing from recent sales orders.</div>
             <style>{`@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }`}</style>
           </div>
@@ -418,7 +598,56 @@ export default function POIntake() {
             </div>
           )}
 
-          <Card title="Customer & PO Details" style={{ marginBottom: 16 }}>
+          <Card
+            title="Customer & PO Details"
+            style={{ marginBottom: 16 }}
+            action={
+              <button
+                onClick={() => setCustomerPickerOpen(true)}
+                style={{
+                  padding: "6px 12px", borderRadius: RADIUS.md,
+                  border: `1px solid ${COLORS.borderStrong}`,
+                  background: COLORS.surface, color: COLORS.textMuted,
+                  fontSize: 11, fontWeight: 600, cursor: "pointer",
+                  display: "flex", alignItems: "center", gap: 6,
+                }}
+              >
+                <Ic name="userPlus" size={12} color={COLORS.textMuted} />
+                Find or create customer
+              </button>
+            }
+          >
+            {/* Prominent prompt when customer didn't match — biggest UX gap fixed by PR (B) */}
+            {!extraction.customerCode && (
+              <div style={{
+                margin: "0 24px", marginTop: 16, padding: "14px 18px",
+                borderRadius: RADIUS.lg, background: COLORS.warningBg,
+                border: `1.5px solid ${COLORS.warning}`,
+                display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16,
+              }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.warningDark }}>
+                    Customer not in SQL Account yet
+                  </div>
+                  <div style={{ fontSize: 12, color: COLORS.warningDark, marginTop: 3, opacity: 0.85 }}>
+                    AI extracted "{extraction.customerName || 'unknown'}" but couldn't find a matching record. Search existing customers or create a new one.
+                  </div>
+                </div>
+                <button
+                  onClick={() => setCustomerPickerOpen(true)}
+                  style={{
+                    padding: "10px 18px", borderRadius: RADIUS.md,
+                    background: COLORS.warningDark, color: "#fff",
+                    fontSize: 12, fontWeight: 700, border: "none", cursor: "pointer",
+                    whiteSpace: "nowrap",
+                    display: "flex", alignItems: "center", gap: 6,
+                  }}
+                >
+                  <Ic name="userPlus" size={14} color="#fff" />
+                  Find or create customer
+                </button>
+              </div>
+            )}
             <div style={{ padding: "16px 24px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
               <FieldBlock label="Customer" value={extraction.customerName} confidence={extraction.customerName_confidence} sub={extraction.customerCode ? `Code: ${extraction.customerCode}` : "Not matched — cannot submit"} />
               <FieldBlock label="PO Number" value={extraction.poNumber || "—"} confidence={extraction.poNumber_confidence} />
@@ -475,7 +704,15 @@ export default function POIntake() {
                 </thead>
                 <tbody>
                   {items.map((item, i) => (
-                    <ItemRow key={i} item={item} index={i} onUpdate={updateItem} onRemove={removeItem} stockItems={stockItems} />
+                    <ItemRow
+                      key={i}
+                      item={item}
+                      index={i}
+                      onUpdate={updateItem}
+                      onRemove={removeItem}
+                      stockItems={stockItems}
+                      onOpenStockPicker={(rowIdx) => setStockPickerForRow(rowIdx)}
+                    />
                   ))}
                 </tbody>
                 <tfoot>
@@ -535,7 +772,7 @@ export default function POIntake() {
 }
 
 // ── ITEM ROW ─────────────────────────────────────────────────
-function ItemRow({ item, index, onUpdate, onRemove, stockItems }) {
+function ItemRow({ item, index, onUpdate, onRemove, stockItems, onOpenStockPicker }) {
   const [editing, setEditing] = useState(null);
   const [stockSearch, setStockSearch] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
@@ -546,6 +783,15 @@ function ItemRow({ item, index, onUpdate, onRemove, stockItems }) {
     : stockItems.slice(0, 10);
 
   function selectStock(s) { onUpdate(index, "itemcode", s.code); setShowDropdown(false); setStockSearch(""); setEditing(null); }
+
+  // PR (B): Open the full stock picker modal — used when no good match in the
+  // inline dropdown and the team needs to either search more thoroughly or
+  // create a new stock item entirely.
+  function openPicker() {
+    setShowDropdown(false);
+    setEditing(null);
+    if (onOpenStockPicker) onOpenStockPicker(index, item.description || "");
+  }
 
   return (
     <tr style={{ borderBottom: `1px solid ${COLORS.borderFaint}`, background: (!item.unitprice || Number(item.unitprice) === 0) ? `${COLORS.dangerBg}44` : "transparent" }}>
@@ -561,14 +807,32 @@ function ItemRow({ item, index, onUpdate, onRemove, stockItems }) {
             <input autoFocus value={stockSearch} onChange={e => { setStockSearch(e.target.value); setShowDropdown(true); }}
               onFocus={() => setShowDropdown(true)} onBlur={() => setTimeout(() => { setShowDropdown(false); setEditing(null); }, 200)}
               placeholder="Search code or name…" style={{ ...editWide, textAlign: "left" }} />
-            {showDropdown && filtered.length > 0 && (
-              <div style={{ position: "absolute", top: "100%", left: 12, right: 12, zIndex: 50, background: COLORS.surface, borderRadius: RADIUS.lg, border: `1px solid ${COLORS.borderStrong}`, boxShadow: SHADOWS.dropdown, maxHeight: 220, overflowY: "auto" }}>
+            {showDropdown && (
+              <div style={{ position: "absolute", top: "100%", left: 12, right: 12, zIndex: 50, background: COLORS.surface, borderRadius: RADIUS.lg, border: `1px solid ${COLORS.borderStrong}`, boxShadow: SHADOWS.dropdown, maxHeight: 280, overflowY: "auto" }}>
                 {filtered.map(s => (
                   <div key={s.code} onMouseDown={() => selectStock(s)} style={{ padding: "8px 14px", cursor: "pointer", borderBottom: `1px solid ${COLORS.borderFaint}`, fontSize: 12 }}>
                     <span style={{ fontFamily: FONT.mono, fontWeight: 600, color: "#1E3A5F" }}>{s.code}</span>
                     <span style={{ color: COLORS.textMuted, marginLeft: 8 }}>{s.description}</span>
                   </div>
                 ))}
+                {filtered.length === 0 && stockSearch.trim() && (
+                  <div style={{ padding: "10px 14px", fontSize: 11, color: COLORS.textMuted, fontStyle: "italic" }}>
+                    No matches for "{stockSearch}"
+                  </div>
+                )}
+                {/* PR (B): Always offer "Create new" as the last option */}
+                <div
+                  onMouseDown={openPicker}
+                  style={{
+                    padding: "10px 14px", cursor: "pointer", fontSize: 12,
+                    background: COLORS.surfaceAlt, color: BRAND.accent, fontWeight: 700,
+                    display: "flex", alignItems: "center", gap: 6,
+                    borderTop: `1px solid ${COLORS.borderStrong}`,
+                  }}
+                >
+                  <Ic name="plusCircle" size={12} color={BRAND.accent} />
+                  Find more or create new stock item…
+                </div>
               </div>
             )}
           </div>
