@@ -129,10 +129,11 @@ export default async function handler(req, res) {
     const fullContent = [...contentBlocks, { type: 'text', text: contextPrompt }];
 
     let lastError = null;
-    // Two attempts max. With max_tokens raised to 8000, single attempts succeed
-    // reliably; second attempt only helps with transient network/model failures.
-    // Three attempts × 35s = 105s, exceeds Vercel's 60s ceiling.
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // Single attempt. Claude calls from Vercel iad1 take 30-40s; a retry
+    // would risk hitting the 120s function budget. If extraction fails,
+    // the team clicks Extract again — the second click hits a warm function
+    // and gets fresh network conditions.
+    for (let attempt = 0; attempt < 1; attempt++) {
       try {
         const model = MODELS[Math.min(attempt, MODELS.length - 1)];
         const claudeMessages = [{
@@ -201,8 +202,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(500).json({
-      error: `PO extraction failed after 2 attempts. Last: ${lastError}`,
-      suggestion: 'Try a clearer image/PDF, or use Paste Text with fewer items.',
+      error: `PO extraction failed. ${lastError}`,
+      suggestion: 'Try again — the model or network may have been slow. If it keeps failing, the PO may be too large; try Paste Text with fewer items.',
     });
 
   } catch (err) {
@@ -443,9 +444,10 @@ async function callClaude(apiKey, model, messages) {
     // 8000 max_tokens — Tarik Bistro-class POs (30+ items × bboxes × confidence
     // fields) easily exceed 4000. Truncated responses fail JSON.parse silently.
     body: JSON.stringify({ model, max_tokens: 8000, system: buildSystemPrompt(), messages }),
-    // 35s timeout — Claude 4.x typically responds in 15-25s. Tighter timeout
-    // means two attempts fit cleanly within Vercel's 60s function limit.
-    signal: AbortSignal.timeout(35000),
+    // 90s timeout — Claude API calls from Vercel iad1 region to Anthropic
+    // regularly take 30-40s for large POs. Production logs confirmed.
+    // 90s + Postgres + JSON = ~100s, fits inside the 120s function budget.
+    signal: AbortSignal.timeout(90000),
   });
   if (!resp.ok) {
     const body = await resp.text();
