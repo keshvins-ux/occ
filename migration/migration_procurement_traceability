@@ -1,0 +1,582 @@
+-- ============================================================
+-- OCC Procurement + Traceability Migration
+-- File: migration_procurement_traceability.sql
+-- Date: 2026-05-03
+--
+-- Purpose
+--   Adds the data model needed for:
+--     1. Halal compliance (supplier certs, expiry tracking, item coverage)
+--     2. Goods-receipt lot tracking (link incoming stock to specific lots)
+--     3. Production batch tracking (link finished goods to lots consumed)
+--     4. Audit trails for compliance overrides
+--     5. End-to-end forward and reverse traceability for JAKIM + recall
+--
+-- Design decisions
+--   - All OCC-native tables prefixed `occ_` to distinguish from `sql_*`
+--     mirror tables synced from SQL Account.
+--   - We never modify `sql_*` tables — those are owned by the sync layer.
+--   - Foreign keys to `sql_suppliers.code` and `sql_stockitems.code`
+--     are SOFT — we use the value but don't enforce FK constraints,
+--     because the SQL Account sync can replace those rows and we don't
+--     want OCC's tables to block syncs.
+--   - All tables include occ_created_at + occ_updated_at for audit.
+--   - All inserts default to logged-in user via app-level code, not DB triggers.
+--   - This migration is fully reversible — see DOWN section at bottom.
+--
+-- Run order: This is one transaction. Either all tables exist, or none.
+-- Rollback: psql ... < migration_procurement_traceability_DOWN.sql
+-- ============================================================
+
+BEGIN;
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 1: HALAL COMPLIANCE
+-- Tables: occ_supplier_halal_certs, occ_supplier_halal_cert_items
+-- Purpose: track Halal certs per supplier, with expiry + scope
+-- ────────────────────────────────────────────────────────────
+
+-- One row per cert per supplier per period.
+-- When a cert is renewed, the old row stays (status='expired') for audit.
+-- Multiple active rows per supplier OK if they have multiple certs from
+-- different authorities (rare but possible).
+CREATE TABLE occ_supplier_halal_certs (
+  id              SERIAL PRIMARY KEY,
+
+  -- Supplier reference (soft FK — see design decisions)
+  supplier_code   VARCHAR(20) NOT NULL,
+
+  -- Cert details
+  cert_no         VARCHAR(100) NOT NULL,
+  cert_authority  VARCHAR(50),    -- JAKIM | JAIN | JAIS | MUI | overseas
+  issued_date     DATE,
+  expiry_date     DATE NOT NULL,  -- audit-critical: this drives all warnings
+
+  -- Status: active | expired | suspended | revoked
+  -- 'expired' is set automatically by a daily job (or computed view);
+  -- 'suspended'/'revoked' set manually if cert pulled mid-period.
+  status          VARCHAR(20) NOT NULL DEFAULT 'active',
+
+  -- Scope as written on the cert (free text — JAKIM certs vary widely)
+  -- Example: "processed spices, dry goods, and packaged condiments"
+  scope_text      TEXT,
+
+  -- File reference (PDF stored on filesystem at /opt/occ/halal-certs/...)
+  -- NULL is acceptable — physical-only suppliers can be registered without
+  -- a digital copy, then PDF added later.
+  cert_pdf_path   TEXT,
+
+  -- Audit
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  occ_created_by  VARCHAR(100),   -- username who registered this cert
+  occ_updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  occ_updated_by  VARCHAR(100),
+
+  CONSTRAINT chk_cert_status CHECK (status IN ('active', 'expired', 'suspended', 'revoked')),
+  CONSTRAINT uq_supplier_cert UNIQUE (supplier_code, cert_no)
+);
+
+CREATE INDEX idx_halal_certs_supplier ON occ_supplier_halal_certs(supplier_code);
+CREATE INDEX idx_halal_certs_expiry ON occ_supplier_halal_certs(expiry_date);
+CREATE INDEX idx_halal_certs_status ON occ_supplier_halal_certs(status);
+
+COMMENT ON TABLE occ_supplier_halal_certs IS 'Halal cert registry per supplier. Multiple rows per supplier OK (renewals + multi-auth).';
+COMMENT ON COLUMN occ_supplier_halal_certs.scope_text IS 'Free-text scope from cert document. Used when item-level coverage is impractical.';
+
+-- Items each cert explicitly covers.
+-- If cert is broad-scope ("dry goods"), this table can stay empty —
+-- coverage is implied by active cert + scope_text.
+-- If cert is item-specific (some JAKIM certs list every SKU), one row per item.
+CREATE TABLE occ_supplier_halal_cert_items (
+  id           SERIAL PRIMARY KEY,
+  cert_id      INTEGER NOT NULL REFERENCES occ_supplier_halal_certs(id) ON DELETE CASCADE,
+
+  -- Item reference (soft FK to sql_stockitems.code)
+  -- NULL OK: when cert covers a category not a specific item
+  item_code    VARCHAR(50),
+
+  -- Free text from cert (what the cert literally says, may not match
+  -- our item codes exactly — useful for audit even if item_code is NULL)
+  item_name    VARCHAR(200),
+  category     VARCHAR(100),    -- e.g. "spices", "oils", "packaging"
+
+  notes        TEXT,
+  occ_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_halal_cert_items_cert ON occ_supplier_halal_cert_items(cert_id);
+CREATE INDEX idx_halal_cert_items_code ON occ_supplier_halal_cert_items(item_code) WHERE item_code IS NOT NULL;
+
+COMMENT ON TABLE occ_supplier_halal_cert_items IS 'Items covered by a cert. NULL item_code = covered at scope_text level only.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 2: COMPLIANCE OVERRIDES (audit trail)
+-- Table: occ_compliance_overrides
+-- Purpose: record when a user proceeds despite a Halal warning
+--
+-- This is the "JAKIM asks why you ordered from supplier X when their cert
+-- expired" answer. Captured at decision time, not reconstructed later.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE occ_compliance_overrides (
+  id              SERIAL PRIMARY KEY,
+
+  -- What was overridden
+  context_type    VARCHAR(50) NOT NULL,  -- 'po_submit' | 'grn_record' | 'batch_start'
+  context_ref     VARCHAR(100),          -- docno of PO/GRN/batch overridden
+
+  supplier_code   VARCHAR(20),
+  item_code       VARCHAR(50),
+
+  -- Why was it flagged
+  warning_level   VARCHAR(20) NOT NULL,  -- 'expiring_30d' | 'expiring_7d' | 'expired' | 'no_cert' | 'item_not_covered'
+  warning_detail  TEXT,                  -- system-generated description at the time
+
+  -- Why did the user proceed
+  override_reason TEXT NOT NULL,         -- user's typed justification
+  override_by     VARCHAR(100) NOT NULL, -- username who clicked "proceed anyway"
+
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_override_context CHECK (context_type IN ('po_submit', 'grn_record', 'batch_start', 'other')),
+  CONSTRAINT chk_override_warning_level CHECK (warning_level IN ('expiring_30d', 'expiring_7d', 'expired', 'no_cert', 'item_not_covered'))
+);
+
+CREATE INDEX idx_overrides_supplier ON occ_compliance_overrides(supplier_code);
+CREATE INDEX idx_overrides_context ON occ_compliance_overrides(context_type, context_ref);
+CREATE INDEX idx_overrides_created ON occ_compliance_overrides(occ_created_at DESC);
+
+COMMENT ON TABLE occ_compliance_overrides IS 'Audit trail when user proceeds despite Halal warnings. Required for JAKIM defense.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 3: GOODS RECEIPTS WITH LOT TRACKING
+-- Tables: occ_goods_receipts, occ_goods_receipt_lots
+-- Purpose: capture lot numbers + expiry at the moment goods arrive
+--
+-- This is the bridge between PO (no lot info) and production (consumes lots).
+-- The existing api/procurement.js GRN flow uses Redis for pending GRNs
+-- and posts to SQL Account /goodsreceivenote — we keep that working,
+-- but ALSO write a permanent record here with lot detail.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE occ_goods_receipts (
+  id              SERIAL PRIMARY KEY,
+
+  -- Internal GRN reference (e.g. GRN-1746284928 from existing flow)
+  grn_ref         VARCHAR(50) NOT NULL UNIQUE,
+
+  -- The PO this GRN is against (soft FK to sql_purchaseorders.dockey)
+  po_dockey       INTEGER,
+  po_docno        VARCHAR(50),
+
+  -- Supplier delivering (soft FK)
+  supplier_code   VARCHAR(20),
+
+  -- When goods physically arrived
+  receipt_date    DATE NOT NULL,
+  received_by     VARCHAR(100),
+
+  -- SQL Account doc reference (after GRN approved + posted to SQL)
+  -- NULL when GRN is still pending Varin's approval
+  sql_docno       VARCHAR(50),
+  sql_dockey      INTEGER,
+  posted_to_sql_at TIMESTAMPTZ,
+
+  -- Status
+  status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+  approved_by     VARCHAR(100),
+  approved_at     TIMESTAMPTZ,
+
+  notes           TEXT,
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  occ_updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_grn_status CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled'))
+);
+
+CREATE INDEX idx_grn_po ON occ_goods_receipts(po_dockey) WHERE po_dockey IS NOT NULL;
+CREATE INDEX idx_grn_supplier ON occ_goods_receipts(supplier_code);
+CREATE INDEX idx_grn_date ON occ_goods_receipts(receipt_date DESC);
+CREATE INDEX idx_grn_status ON occ_goods_receipts(status);
+
+COMMENT ON TABLE occ_goods_receipts IS 'GRN headers. Each row = one delivery from supplier on a date.';
+
+-- One row per (item × lot) received. A single GRN line can split into
+-- multiple lots if the same item arrives with mixed lot numbers.
+-- This table is THE source of truth for "what lot of what came in when."
+CREATE TABLE occ_goods_receipt_lots (
+  id              SERIAL PRIMARY KEY,
+  grn_id          INTEGER NOT NULL REFERENCES occ_goods_receipts(id) ON DELETE CASCADE,
+
+  -- Item received (soft FK to sql_stockitems.code)
+  item_code       VARCHAR(50) NOT NULL,
+  item_description VARCHAR(200),
+
+  -- Lot identifier from supplier (their batch/lot number)
+  -- May be NULL for non-lot-tracked items (e.g. packaging)
+  lot_no          VARCHAR(100),
+
+  -- Expiry / best-before from supplier label (often null for spices)
+  lot_expiry      DATE,
+
+  -- Quantity in this lot
+  qty             NUMERIC(12,4) NOT NULL,
+  qty_remaining   NUMERIC(12,4) NOT NULL,  -- decremented as production consumes
+  uom             VARCHAR(20) NOT NULL,
+
+  unit_cost       NUMERIC(12,4),
+
+  -- Quality status
+  qc_status       VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending | released | rejected | hold
+
+  notes           TEXT,
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_grn_lot_qty_positive CHECK (qty > 0),
+  CONSTRAINT chk_grn_lot_remaining CHECK (qty_remaining >= 0 AND qty_remaining <= qty),
+  CONSTRAINT chk_grn_lot_qc_status CHECK (qc_status IN ('pending', 'released', 'rejected', 'hold'))
+);
+
+CREATE INDEX idx_grn_lots_grn ON occ_goods_receipt_lots(grn_id);
+CREATE INDEX idx_grn_lots_item ON occ_goods_receipt_lots(item_code);
+CREATE INDEX idx_grn_lots_lot_no ON occ_goods_receipt_lots(lot_no) WHERE lot_no IS NOT NULL;
+CREATE INDEX idx_grn_lots_remaining ON occ_goods_receipt_lots(item_code, qty_remaining)
+  WHERE qty_remaining > 0 AND qc_status = 'released';
+CREATE INDEX idx_grn_lots_expiry ON occ_goods_receipt_lots(lot_expiry) WHERE lot_expiry IS NOT NULL;
+
+COMMENT ON TABLE occ_goods_receipt_lots IS 'Per-lot detail of received goods. qty_remaining decremented as production consumes from this lot.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 4: SUPPLIER CERT SNAPSHOTS
+-- Table: occ_supplier_cert_snapshots
+-- Purpose: freeze cert state at the moment a GRN is recorded
+--
+-- Why: a cert is valid today but expires next month. If we receive
+-- goods today and JAKIM audits 6 months from now, "what was the cert
+-- state when these goods arrived" matters. Frozen at receipt time so
+-- subsequent expiry doesn't rewrite history.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE occ_supplier_cert_snapshots (
+  id              SERIAL PRIMARY KEY,
+  grn_id          INTEGER NOT NULL REFERENCES occ_goods_receipts(id) ON DELETE CASCADE,
+
+  -- What we knew at receipt time
+  cert_id         INTEGER REFERENCES occ_supplier_halal_certs(id),  -- nullable: no cert recorded
+  cert_no         VARCHAR(100),
+  cert_authority  VARCHAR(50),
+  cert_expiry_at_receipt DATE,
+  cert_status_at_receipt VARCHAR(20),
+
+  -- What was the warning level at the time
+  warning_level   VARCHAR(20),  -- ok | expiring_30d | expiring_7d | expired | no_cert
+  override_id     INTEGER REFERENCES occ_compliance_overrides(id),
+
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_cert_snapshots_grn ON occ_supplier_cert_snapshots(grn_id);
+CREATE INDEX idx_cert_snapshots_cert ON occ_supplier_cert_snapshots(cert_id) WHERE cert_id IS NOT NULL;
+
+COMMENT ON TABLE occ_supplier_cert_snapshots IS 'Frozen cert state at GRN time. Audit-critical: lets us prove what we knew when.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 5: PRODUCTION BATCHES
+-- Tables: occ_production_batches, occ_production_batch_materials,
+--         occ_production_batch_outputs
+-- Purpose: link finished goods produced ↔ raw material lots consumed
+--
+-- This is the spine of recall capability. Given a finished good batch,
+-- we can trace every lot of every raw material that went into it,
+-- and forward to every customer who received output from this batch.
+-- ────────────────────────────────────────────────────────────
+
+CREATE TABLE occ_production_batches (
+  id              SERIAL PRIMARY KEY,
+
+  -- Internal batch number (e.g. B-2026-0503-FCP-001)
+  batch_no        VARCHAR(50) NOT NULL UNIQUE,
+
+  -- What's being produced (soft FK to sql_stockitems.code — finished good)
+  finished_item_code VARCHAR(50) NOT NULL,
+
+  -- Target vs actual
+  planned_qty     NUMERIC(12,4) NOT NULL,
+  actual_qty      NUMERIC(12,4),
+  uom             VARCHAR(20) NOT NULL,
+
+  -- Timing
+  started_at      TIMESTAMPTZ,
+  completed_at    TIMESTAMPTZ,
+  shift           VARCHAR(20),
+
+  -- Who and what
+  operator        VARCHAR(100),
+  machine         VARCHAR(50),
+
+  -- BOM reference (which BOM version was used)
+  bom_id          INTEGER,  -- soft ref to occ_bom_headers if exists
+
+  -- Quality
+  qc_status       VARCHAR(20) NOT NULL DEFAULT 'in_progress',
+  qc_released_by  VARCHAR(100),
+  qc_released_at  TIMESTAMPTZ,
+  qc_notes        TEXT,
+
+  notes           TEXT,
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  occ_created_by  VARCHAR(100),
+
+  CONSTRAINT chk_batch_planned_qty CHECK (planned_qty > 0),
+  CONSTRAINT chk_batch_actual_qty CHECK (actual_qty IS NULL OR actual_qty >= 0),
+  CONSTRAINT chk_batch_qc_status CHECK (qc_status IN ('in_progress', 'pending_qc', 'released', 'on_hold', 'rejected'))
+);
+
+CREATE INDEX idx_batches_finished_item ON occ_production_batches(finished_item_code);
+CREATE INDEX idx_batches_started ON occ_production_batches(started_at DESC);
+CREATE INDEX idx_batches_qc_status ON occ_production_batches(qc_status);
+
+COMMENT ON TABLE occ_production_batches IS 'Production batch headers. One row per physical run of a finished good.';
+
+-- Lots consumed by each batch. This is HALF of recall traceability:
+--   given a batch → see every lot that went into it (upstream trace)
+-- Combined with occ_production_batch_outputs (downstream), full recall query is possible.
+CREATE TABLE occ_production_batch_materials (
+  id              SERIAL PRIMARY KEY,
+  batch_id        INTEGER NOT NULL REFERENCES occ_production_batches(id) ON DELETE CASCADE,
+
+  -- Which lot was consumed
+  grn_lot_id      INTEGER NOT NULL REFERENCES occ_goods_receipt_lots(id),
+
+  -- For convenience (denormalized — saves joins for common queries)
+  item_code       VARCHAR(50) NOT NULL,
+  lot_no          VARCHAR(100),
+
+  -- How much consumed
+  qty_consumed    NUMERIC(12,4) NOT NULL,
+  uom             VARCHAR(20) NOT NULL,
+
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_batch_mat_qty CHECK (qty_consumed > 0)
+);
+
+CREATE INDEX idx_batch_mat_batch ON occ_production_batch_materials(batch_id);
+CREATE INDEX idx_batch_mat_lot ON occ_production_batch_materials(grn_lot_id);
+CREATE INDEX idx_batch_mat_item ON occ_production_batch_materials(item_code);
+
+COMMENT ON TABLE occ_production_batch_materials IS 'Lots consumed per batch. Source of upstream traceability.';
+
+-- Outputs of a batch. Often 1:1 (one batch → one finished good lot)
+-- but can be 1:N if a batch is split into multiple finished good packages.
+-- The output_lot_no is what propagates downstream into DOs/customers.
+CREATE TABLE occ_production_batch_outputs (
+  id              SERIAL PRIMARY KEY,
+  batch_id        INTEGER NOT NULL REFERENCES occ_production_batches(id) ON DELETE CASCADE,
+
+  -- Output identifier — the lot number that goes on the finished good
+  -- This is what customers see / what we'd recall against.
+  output_lot_no   VARCHAR(100) NOT NULL,
+
+  qty_produced    NUMERIC(12,4) NOT NULL,
+  uom             VARCHAR(20) NOT NULL,
+
+  -- Best-before / expiry computed at production time
+  produced_at     DATE NOT NULL,
+  expiry_date     DATE,
+
+  notes           TEXT,
+  occ_created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_batch_out_qty CHECK (qty_produced > 0)
+);
+
+CREATE INDEX idx_batch_out_batch ON occ_production_batch_outputs(batch_id);
+CREATE INDEX idx_batch_out_lot ON occ_production_batch_outputs(output_lot_no);
+CREATE INDEX idx_batch_out_produced ON occ_production_batch_outputs(produced_at DESC);
+
+COMMENT ON TABLE occ_production_batch_outputs IS 'Finished good output per batch. output_lot_no propagates to DO lines for downstream trace.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 6: HELPER VIEWS
+-- ────────────────────────────────────────────────────────────
+
+-- Current Halal status per supplier — answers "is this supplier safe today"
+CREATE OR REPLACE VIEW v_supplier_halal_status AS
+SELECT
+  s.code AS supplier_code,
+  s.companyname AS supplier_name,
+  c.id AS cert_id,
+  c.cert_no,
+  c.cert_authority,
+  c.expiry_date,
+  c.status AS cert_status,
+  CASE
+    WHEN c.id IS NULL THEN 'no_cert'
+    WHEN c.status IN ('suspended', 'revoked') THEN 'expired'
+    WHEN c.expiry_date < CURRENT_DATE THEN 'expired'
+    WHEN c.expiry_date < CURRENT_DATE + INTERVAL '7 days' THEN 'expiring_7d'
+    WHEN c.expiry_date < CURRENT_DATE + INTERVAL '30 days' THEN 'expiring_30d'
+    ELSE 'ok'
+  END AS warning_level,
+  c.expiry_date - CURRENT_DATE AS days_until_expiry,
+  c.scope_text
+FROM sql_suppliers s
+LEFT JOIN LATERAL (
+  -- Get the latest active cert (or any cert if none active)
+  SELECT *
+  FROM occ_supplier_halal_certs c2
+  WHERE c2.supplier_code = s.code
+  ORDER BY
+    CASE WHEN c2.status = 'active' THEN 0 ELSE 1 END,  -- prefer active
+    c2.expiry_date DESC                                  -- then latest expiry
+  LIMIT 1
+) c ON TRUE;
+
+COMMENT ON VIEW v_supplier_halal_status IS 'Live Halal status per supplier. UI-facing — drives picker warnings.';
+
+-- Recall trace: given an output lot, walk back to suppliers and forward to customers
+-- This is intentionally a view (read-only); UIs and APIs query it for recall scenarios.
+CREATE OR REPLACE VIEW v_recall_trace AS
+SELECT
+  pbo.output_lot_no AS finished_lot,
+  pbo.produced_at,
+  pb.batch_no,
+  pb.finished_item_code,
+  pb.actual_qty AS batch_qty,
+  pbm.item_code AS material_code,
+  pbm.lot_no AS material_lot,
+  pbm.qty_consumed,
+  grl.lot_expiry AS material_expiry,
+  gr.grn_ref,
+  gr.receipt_date,
+  gr.supplier_code,
+  s.companyname AS supplier_name,
+  gr.po_docno
+FROM occ_production_batch_outputs pbo
+JOIN occ_production_batches pb ON pb.id = pbo.batch_id
+JOIN occ_production_batch_materials pbm ON pbm.batch_id = pb.id
+JOIN occ_goods_receipt_lots grl ON grl.id = pbm.grn_lot_id
+JOIN occ_goods_receipts gr ON gr.id = grl.grn_id
+LEFT JOIN sql_suppliers s ON s.code = gr.supplier_code;
+
+COMMENT ON VIEW v_recall_trace IS 'Upstream trace from finished lot to source suppliers. Used by recall UI.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 7: HELPER FUNCTIONS
+-- ────────────────────────────────────────────────────────────
+
+-- Returns the warning level for a supplier × item right now.
+-- Called by PO submission, GRN flow, anywhere we need to gate.
+-- Returns: 'ok' | 'expiring_30d' | 'expiring_7d' | 'expired' | 'no_cert' | 'item_not_covered'
+CREATE OR REPLACE FUNCTION fn_get_supplier_warning_level(
+  p_supplier_code VARCHAR,
+  p_item_code VARCHAR DEFAULT NULL
+) RETURNS VARCHAR AS $$
+DECLARE
+  v_cert_status VARCHAR;
+  v_cert_id INTEGER;
+  v_item_covered BOOLEAN;
+  v_has_item_rows BOOLEAN;
+BEGIN
+  -- First check overall cert status
+  SELECT warning_level, cert_id INTO v_cert_status, v_cert_id
+  FROM v_supplier_halal_status
+  WHERE supplier_code = p_supplier_code;
+
+  IF v_cert_status IS NULL OR v_cert_status = 'no_cert' THEN
+    RETURN 'no_cert';
+  END IF;
+
+  IF v_cert_status IN ('expired', 'expiring_7d', 'expiring_30d') THEN
+    RETURN v_cert_status;
+  END IF;
+
+  -- Cert is active. If item provided, check coverage.
+  IF p_item_code IS NOT NULL AND v_cert_id IS NOT NULL THEN
+    SELECT EXISTS(SELECT 1 FROM occ_supplier_halal_cert_items WHERE cert_id = v_cert_id)
+      INTO v_has_item_rows;
+
+    -- If cert has no item rows, scope is broad — assume covered
+    IF NOT v_has_item_rows THEN
+      RETURN 'ok';
+    END IF;
+
+    -- Cert has item rows — check exact match or NULL (category coverage)
+    SELECT EXISTS(
+      SELECT 1 FROM occ_supplier_halal_cert_items
+      WHERE cert_id = v_cert_id
+        AND (item_code = p_item_code OR item_code IS NULL)
+    ) INTO v_item_covered;
+
+    IF NOT v_item_covered THEN
+      RETURN 'item_not_covered';
+    END IF;
+  END IF;
+
+  RETURN 'ok';
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION fn_get_supplier_warning_level IS 'Returns Halal warning level for supplier × item. Used by all submission gates.';
+
+-- Convenience: returns true if safe to proceed without override.
+-- 'ok' and 'expiring_30d' are non-blocking (yellow warning).
+-- 'expiring_7d', 'expired', 'no_cert', 'item_not_covered' require override.
+CREATE OR REPLACE FUNCTION fn_supplier_safe_to_use(
+  p_supplier_code VARCHAR,
+  p_item_code VARCHAR DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+BEGIN
+  RETURN fn_get_supplier_warning_level(p_supplier_code, p_item_code) IN ('ok', 'expiring_30d');
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION fn_supplier_safe_to_use IS 'Boolean wrapper — true if no override needed.';
+
+-- ────────────────────────────────────────────────────────────
+-- SECTION 8: GRANTS
+-- ────────────────────────────────────────────────────────────
+
+-- All new objects should be readable + writable by occ_user
+-- (the same user the API uses).
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+  occ_supplier_halal_certs,
+  occ_supplier_halal_cert_items,
+  occ_compliance_overrides,
+  occ_goods_receipts,
+  occ_goods_receipt_lots,
+  occ_supplier_cert_snapshots,
+  occ_production_batches,
+  occ_production_batch_materials,
+  occ_production_batch_outputs
+TO occ_user;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO occ_user;
+GRANT SELECT ON v_supplier_halal_status, v_recall_trace TO occ_user;
+GRANT EXECUTE ON FUNCTION fn_get_supplier_warning_level, fn_supplier_safe_to_use TO occ_user;
+
+COMMIT;
+
+-- ============================================================
+-- VERIFICATION QUERIES (run after migration to confirm)
+-- ============================================================
+
+-- 1. All 9 tables exist
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public' AND table_name LIKE 'occ_%'
+ORDER BY table_name;
+
+-- 2. Views exist
+SELECT table_name FROM information_schema.views
+WHERE table_schema = 'public' AND table_name IN ('v_supplier_halal_status', 'v_recall_trace');
+
+-- 3. Functions exist
+SELECT proname FROM pg_proc WHERE proname IN ('fn_get_supplier_warning_level', 'fn_supplier_safe_to_use');
+
+-- 4. Smoke test: should return 'no_cert' for any real supplier (none registered yet)
+SELECT fn_get_supplier_warning_level('400-A001', 'BP-SEED-25KG');
+
+-- 5. View should show all 47 suppliers with warning_level='no_cert'
+SELECT warning_level, COUNT(*)
+FROM v_supplier_halal_status
+GROUP BY warning_level;
