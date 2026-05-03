@@ -1033,7 +1033,288 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(400).json({ error: 'Unknown type. Use ?type=so|invoice|do|so_balance|customer|stockitem' });
+    // ── CREATE PURCHASE ORDER ──────────────────────────────────────────────
+    // Submits a PO to SQL Account /purchaseorder endpoint.
+    // Performs Halal compliance check before submission and records warnings
+    // (or override audit) in occ_compliance_overrides.
+    //
+    // Request body:
+    //   {
+    //     poPayload: {
+    //       code: '400-A001',                  // supplier code (required)
+    //       docdate: '2026-05-03',             // optional, defaults to today in SQL Account
+    //       postdate: '2026-05-03',            // optional
+    //       docref1: 'INTERNAL-REF-123',       // optional, customer/internal reference
+    //       description: 'Purchase Order',     // optional
+    //       sdsdocdetail: [                    // line items
+    //         { seq, itemcode, description, qty, uom, unitprice, amount,
+    //           deliverydate, irbm_classification, remark1, remark2 },
+    //         ...
+    //       ]
+    //     },
+    //     submittedBy: 'yuges',                // username of person creating PO
+    //     overrides: [                         // optional, only if proceeding past warnings
+    //       { itemcode, warning_level, reason }
+    //     ]
+    //   }
+    //
+    // Response:
+    //   200 OK: { dockey, docno, halal_warnings, overrides_recorded }
+    //   400:    { error, warnings }   — if blocking warnings present without overrides
+    //   500:    { error }             — SQL Account or DB error
+    if (type === 'purchaseorder') {
+      const { poPayload, submittedBy, overrides = [] } = req.body;
+      if (!poPayload) return res.status(400).json({ error: 'Missing poPayload' });
+      if (!poPayload.code) return res.status(400).json({ error: 'Supplier code required (poPayload.code)' });
+      if (!submittedBy) return res.status(400).json({ error: 'submittedBy required for audit trail' });
+
+      const supplierCode = poPayload.code;
+      const lines = poPayload.sdsdocdetail || [];
+
+      // VALIDATION 1: Lines exist (SQL Account allows empty PO submission but
+      // we don't — empty POs are operational noise).
+      if (lines.length === 0) {
+        return res.status(400).json({ error: 'PO must have at least one line item' });
+      }
+
+      // VALIDATION 2: Each line has required fields
+      const lineErrors = [];
+      lines.forEach((l, i) => {
+        if (!l.itemcode) lineErrors.push(`Line ${i + 1}: itemcode required`);
+        if (!l.qty || parseFloat(l.qty) <= 0) lineErrors.push(`Line ${i + 1}: qty must be > 0`);
+        if (!l.uom) lineErrors.push(`Line ${i + 1}: uom required`);
+        if (l.unitprice === undefined || l.unitprice === null) lineErrors.push(`Line ${i + 1}: unitprice required`);
+      });
+      if (lineErrors.length > 0) {
+        return res.status(400).json({ error: 'Line validation failed', details: lineErrors });
+      }
+
+      // HALAL COMPLIANCE CHECK
+      // For each line, compute warning level. Group results by item.
+      // Block submission if any line has a warning that wasn't explicitly overridden.
+      const halalWarnings = [];
+      const overridesByItem = {};
+      for (const o of overrides) overridesByItem[o.itemcode] = o;
+
+      for (const line of lines) {
+        try {
+          const warnRes = await pgQuery(
+            'SELECT fn_get_supplier_warning_level($1, $2) AS level',
+            [supplierCode, line.itemcode]
+          );
+          const level = warnRes.rows[0]?.level || 'no_cert';
+
+          if (level !== 'ok' && level !== 'expiring_30d') {
+            // Blocking-level warning — needs override
+            const ov = overridesByItem[line.itemcode];
+            if (!ov || ov.warning_level !== level) {
+              halalWarnings.push({
+                itemcode: line.itemcode,
+                warning_level: level,
+                blocking: true,
+                message: `Supplier ${supplierCode} has Halal warning '${level}' for ${line.itemcode}. Override required.`,
+              });
+            } else {
+              // Override provided — record it
+              halalWarnings.push({
+                itemcode: line.itemcode,
+                warning_level: level,
+                blocking: false,
+                overridden: true,
+                reason: ov.reason,
+              });
+            }
+          } else if (level === 'expiring_30d') {
+            // Yellow warning — not blocking, but surfaced
+            halalWarnings.push({
+              itemcode: line.itemcode,
+              warning_level: 'expiring_30d',
+              blocking: false,
+              message: `Cert for ${supplierCode} expires within 30 days.`,
+            });
+          }
+        } catch (e) {
+          // Function failure shouldn't block the PO — log and continue
+          console.error(`Halal check error for ${line.itemcode}:`, e.message);
+        }
+      }
+
+      // If any blocking warnings remain unresolved, refuse submission
+      const blockers = halalWarnings.filter(w => w.blocking);
+      if (blockers.length > 0) {
+        return res.status(400).json({
+          error: 'Halal compliance warnings require override',
+          warnings: blockers,
+          hint: 'Provide overrides[] in request body with reason per blocked item',
+        });
+      }
+
+      // SUBMIT TO SQL ACCOUNT
+      console.log(`[purchaseorder] submitting PO for supplier=${supplierCode}, lines=${lines.length}, by=${submittedBy}`);
+      const sqlResult = await postToSQL('/purchaseorder', poPayload);
+
+      if (sqlResult.isHTML) {
+        return res.status(503).json({ error: 'SQL Account auth/network error — try again' });
+      }
+      if (!sqlResult.ok || sqlResult.data?.error) {
+        const msg = sqlResult.data?.error?.message || sqlResult.data?.error || `SQL Account returned status ${sqlResult.status}`;
+        console.error(`[purchaseorder] SQL Account rejected:`, msg);
+        return res.status(400).json({ error: msg, sql_status: sqlResult.status });
+      }
+
+      const dockey = sqlResult.data.dockey;
+      const docno = sqlResult.data.docno;
+      console.log(`[purchaseorder] created ${docno} (dockey ${dockey})`);
+
+      // RECORD OVERRIDES IN AUDIT TABLE
+      // (do this after SQL submission succeeds — no orphan overrides)
+      const overrideIds = [];
+      for (const w of halalWarnings.filter(x => x.overridden)) {
+        try {
+          const ovRes = await pgQuery(
+            `INSERT INTO occ_compliance_overrides
+              (context_type, context_ref, supplier_code, item_code, warning_level, warning_detail, override_reason, override_by)
+             VALUES ('po_submit', $1, $2, $3, $4, $5, $6, $7)
+             RETURNING id`,
+            [docno, supplierCode, w.itemcode, w.warning_level,
+             `PO ${docno} line ${w.itemcode}: ${w.warning_level}`, w.reason, submittedBy]
+          );
+          overrideIds.push(ovRes.rows[0].id);
+        } catch (e) {
+          // Audit logging failure is concerning but shouldn't fail the PO
+          console.error(`[purchaseorder] failed to log override for ${w.itemcode}:`, e.message);
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        dockey,
+        docno,
+        supplier: sqlResult.data.companyname || supplierCode,
+        amount: sqlResult.data.docamt,
+        halal_warnings: halalWarnings,
+        overrides_recorded: overrideIds,
+        message: `PO ${docno} created in SQL Account.`,
+      });
+    }
+
+    // ── CREATE SUPPLIER ────────────────────────────────────────────────────
+    // Registers a new supplier in SQL Account /supplier endpoint AND
+    // captures Halal cert info into OCC's compliance tables.
+    //
+    // Request body:
+    //   {
+    //     supplierPayload: {
+    //       code: '400-NEW01',
+    //       companyname: 'New Supplier Sdn Bhd',
+    //       address1, address2, postcode, city, state, country,
+    //       phone1, email1, attention,
+    //       terms, currencycode, area, agent, project
+    //     },
+    //     halalCert: {                         // optional — can be added later
+    //       cert_no, cert_authority, issued_date, expiry_date,
+    //       scope_text, cert_pdf_path,
+    //       items: [{ item_code, item_name, category }]
+    //     },
+    //     submittedBy: 'varin'
+    //   }
+    if (type === 'supplier') {
+      const { supplierPayload, halalCert, submittedBy } = req.body;
+      if (!supplierPayload) return res.status(400).json({ error: 'Missing supplierPayload' });
+      if (!supplierPayload.code) return res.status(400).json({ error: 'Supplier code required' });
+      if (!supplierPayload.companyname) return res.status(400).json({ error: 'Company name required' });
+      if (!submittedBy) return res.status(400).json({ error: 'submittedBy required for audit trail' });
+
+      // Check supplier doesn't already exist in PG (sync layer would have it)
+      const existRes = await pgQuery('SELECT code FROM sql_suppliers WHERE code = $1', [supplierPayload.code]);
+      if (existRes.rows.length > 0) {
+        return res.status(400).json({
+          error: `Supplier code ${supplierPayload.code} already exists.`,
+          hint: 'To update existing supplier, edit in SQL Account directly.',
+        });
+      }
+
+      // Apply OCC defaults for fields SQL Account expects
+      const payload = {
+        area: '----',
+        agent: '----',
+        project: '----',
+        terms: '30 Days',
+        currencycode: '----',
+        currencyrate: '1',
+        country: 'MY',
+        ...supplierPayload,  // user-provided fields override defaults
+      };
+
+      // SUBMIT TO SQL ACCOUNT
+      console.log(`[supplier] creating supplier ${payload.code} (${payload.companyname}) by=${submittedBy}`);
+      const sqlResult = await postToSQL('/supplier', payload);
+
+      if (sqlResult.isHTML) {
+        return res.status(503).json({ error: 'SQL Account auth/network error — try again' });
+      }
+      if (!sqlResult.ok || sqlResult.data?.error) {
+        const msg = sqlResult.data?.error?.message || sqlResult.data?.error || `SQL Account returned status ${sqlResult.status}`;
+        console.error(`[supplier] SQL Account rejected:`, msg);
+        return res.status(400).json({ error: msg, sql_status: sqlResult.status });
+      }
+
+      console.log(`[supplier] created ${payload.code} in SQL Account`);
+
+      // RECORD HALAL CERT IF PROVIDED
+      let certId = null;
+      if (halalCert) {
+        if (!halalCert.cert_no || !halalCert.expiry_date) {
+          // Don't fail the supplier creation, but warn
+          console.warn(`[supplier] cert provided for ${payload.code} but missing cert_no or expiry_date — skipping`);
+        } else {
+          try {
+            const certRes = await pgQuery(
+              `INSERT INTO occ_supplier_halal_certs
+                (supplier_code, cert_no, cert_authority, issued_date, expiry_date,
+                 scope_text, cert_pdf_path, status, occ_created_by, occ_updated_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $8)
+               RETURNING id`,
+              [payload.code, halalCert.cert_no, halalCert.cert_authority || 'JAKIM',
+               halalCert.issued_date, halalCert.expiry_date,
+               halalCert.scope_text, halalCert.cert_pdf_path, submittedBy]
+            );
+            certId = certRes.rows[0].id;
+
+            // Optional per-item coverage rows
+            if (Array.isArray(halalCert.items) && halalCert.items.length > 0) {
+              for (const item of halalCert.items) {
+                await pgQuery(
+                  `INSERT INTO occ_supplier_halal_cert_items
+                    (cert_id, item_code, item_name, category, notes)
+                   VALUES ($1, $2, $3, $4, $5)`,
+                  [certId, item.item_code || null, item.item_name, item.category, item.notes]
+                );
+              }
+            }
+            console.log(`[supplier] registered cert ${halalCert.cert_no} for ${payload.code} (cert_id=${certId})`);
+          } catch (e) {
+            // Cert recording failed but supplier was created in SQL Account.
+            // Don't roll back — supplier exists, cert can be re-attached via UI later.
+            console.error(`[supplier] cert recording failed for ${payload.code}:`, e.message);
+          }
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        code: payload.code,
+        name: payload.companyname,
+        sql_response: {
+          code: sqlResult.data.code,
+          companyname: sqlResult.data.companyname,
+        },
+        cert_id: certId,
+        message: `Supplier ${payload.code} created in SQL Account${certId ? ' with Halal cert recorded' : ''}.`,
+      });
+    }
+
+    return res.status(400).json({ error: 'Unknown type. Use ?type=so|invoice|do|so_balance|customer|stockitem|purchaseorder|supplier' });
 
   } catch(err) {
     console.error('create-doc error:', err);
