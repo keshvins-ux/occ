@@ -22,25 +22,42 @@ import config from "../config";
 
 const CREDIT_TERMS = ["14 Days", "30 Days", "45 Days", "60 Days", "C.O.D."];
 
+// AREAS — must match values registered in SQL Account's Area master.
+// Currently only 3 values exist in sql_customers: ----, CORP, VS.
+// If the team starts using a new area code, add it in SQL Account first
+// (Customer → Maintain Area), then add it here.
+const AREAS = [
+  { value: "----", label: "---- (Default / unassigned)" },
+  { value: "CORP", label: "CORP (Corporate)" },
+  { value: "VS",   label: "VS (Vertical Services)" },
+];
+
 export default function CustomerPickerModal({ prefilledName, prefilledAddress, onPick, onClose }) {
   const [mode, setMode] = useState("search"); // 'search' | 'create'
   const [searchQ, setSearchQ] = useState(prefilledName || "");
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [recentCodes, setRecentCodes] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [suggestingCode, setSuggestingCode] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState("");
 
   // Create-mode form state
+  // Defaults match SQL Account's expected values:
+  //   - currencycode: "----" is what existing customers use (NOT "MYR" — that fails FK validation)
+  //   - country: "MY" is the 2-char ISO code SQL Account stores (NOT "Malaysia" — gets truncated to "Ma")
+  //   - companycategory: required, must match one of the values from /api/prospects?type=customer_categories
   const [form, setForm] = useState({
-    code:           "",
-    companyname:    prefilledName || "",
-    companyname2:   "",
-    controlaccount: config.sqlControlAccount || "300-0000",
-    currencycode:   config.sqlCurrency || "MYR",
-    creditterm:     "", // forced pick — no default
-    area:           "",
-    brn:            "",
+    code:            "",
+    companyname:     prefilledName || "",
+    companyname2:    "",
+    companycategory: "", // forced pick — required by SQL Account FK
+    controlaccount:  config.sqlControlAccount || "300-0000",
+    currencycode:    "----",  // SQL Account default — DO NOT change to "MYR"
+    creditterm:      "", // forced pick — no default
+    area:            "", // forced pick — must match an existing area code
+    brn:             "",
     branch: {
       address1:  prefilledAddress?.line1 || "",
       address2:  prefilledAddress?.line2 || "",
@@ -49,7 +66,7 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
       postcode:  prefilledAddress?.postcode || "",
       city:      prefilledAddress?.city || "",
       state:     prefilledAddress?.state || "",
-      country:   "Malaysia",
+      country:   "MY", // ISO 2-char — SQL Account stores 2 chars max
       attention: "",
       phone1:    prefilledAddress?.phone || "",
       mobile:    prefilledAddress?.mobile || "",
@@ -84,14 +101,36 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
     }
   }, [prefilledName]);
 
-  // Load recent codes when entering create mode
+  // Load recent codes + categories + auto-suggest a code on entering create mode
   async function enterCreateMode() {
     setMode("create");
     setErr("");
+
+    // 1. Recent codes (existing — keeps the visual hint)
     try {
       const r = await fetch("/api/prospects?type=recent_customer_codes").then(r => r.json()).catch(() => ({}));
       setRecentCodes(r.codes || []);
     } catch {}
+
+    // 2. Company categories — populates the dropdown
+    try {
+      const r = await fetch("/api/prospects?type=customer_categories").then(r => r.json()).catch(() => ({}));
+      setCategories(r.categories || []);
+    } catch {}
+
+    // 3. Suggest the next code based on the customer name (if we have one).
+    //    User can override in the form — this is just a hint, not a lock.
+    if (form.companyname?.trim()) {
+      setSuggestingCode(true);
+      try {
+        const r = await fetch(
+          `/api/prospects?type=next_customer_code&name=${encodeURIComponent(form.companyname.trim())}`
+        ).then(r => r.json()).catch(() => ({}));
+        if (r.suggested) {
+          setForm(prev => ({ ...prev, code: prev.code || r.suggested }));
+        }
+      } catch {} finally { setSuggestingCode(false); }
+    }
   }
 
   function updateField(key, value) {
@@ -105,13 +144,14 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
   // so the team gets immediate feedback instead of a round-trip for obvious gaps.
   function getMissingFields() {
     const missing = [];
-    if (!form.code?.trim())           missing.push("Customer code");
-    if (!form.companyname?.trim())    missing.push("Company name");
-    if (!form.controlaccount?.trim()) missing.push("Control account");
-    if (!form.currencycode?.trim())   missing.push("Currency");
-    if (!form.creditterm?.trim())     missing.push("Credit term");
-    if (!form.area?.trim())           missing.push("Area");
-    if (!form.brn?.trim())            missing.push("BRN");
+    if (!form.code?.trim())            missing.push("Customer code");
+    if (!form.companyname?.trim())     missing.push("Company name");
+    if (!form.companycategory?.trim()) missing.push("Company category");
+    if (!form.controlaccount?.trim())  missing.push("Control account");
+    if (!form.currencycode?.trim())    missing.push("Currency");
+    if (!form.creditterm?.trim())      missing.push("Credit term");
+    if (!form.area?.trim())            missing.push("Area");
+    if (!form.brn?.trim())             missing.push("BRN");
     if (!form.branch.address1?.trim()) missing.push("Address line 1");
     if (!form.branch.phone1 && !form.branch.mobile) missing.push("Phone or mobile");
     return missing;
@@ -274,7 +314,14 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
             {/* Customer identity */}
             <SectionLabel>Customer identity</SectionLabel>
             <FormRow>
-              <Field label="Customer code" required value={form.code} onChange={v => updateField("code", v)} placeholder="e.g. 300-T0042" mono />
+              <Field
+                label={suggestingCode ? "Customer code (suggesting…)" : "Customer code"}
+                required
+                value={form.code}
+                onChange={v => updateField("code", v)}
+                placeholder="e.g. 300-T0042"
+                mono
+              />
               <Field label="Company name" required value={form.companyname} onChange={v => updateField("companyname", v)} placeholder="e.g. Tarik Bistro Sdn Bhd" />
             </FormRow>
             <FormRow>
@@ -285,10 +332,18 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
             {/* Account setup */}
             <SectionLabel>Account setup</SectionLabel>
             <FormRow>
+              <SelectField
+                label="Company category"
+                required
+                value={form.companycategory}
+                onChange={v => updateField("companycategory", v)}
+                options={categories}
+                placeholder={categories.length === 0 ? "Loading…" : "Pick one…"}
+              />
               <Field label="Control account" required value={form.controlaccount} onChange={v => updateField("controlaccount", v)} mono />
-              <Field label="Currency" required value={form.currencycode} onChange={v => updateField("currencycode", v)} mono />
             </FormRow>
             <FormRow>
+              <Field label="Currency" required value={form.currencycode} onChange={v => updateField("currencycode", v)} mono />
               <SelectField
                 label="Credit term"
                 required
@@ -297,7 +352,18 @@ export default function CustomerPickerModal({ prefilledName, prefilledAddress, o
                 options={CREDIT_TERMS}
                 placeholder="Pick one…"
               />
-              <Field label="Area" required value={form.area} onChange={v => updateField("area", v)} placeholder="e.g. KUALA LUMPUR" />
+            </FormRow>
+            <FormRow>
+              <SelectField
+                label="Area"
+                required
+                value={form.area}
+                onChange={v => updateField("area", v)}
+                options={AREAS.map(a => a.value)}
+                placeholder="Pick one…"
+              />
+              {/* Empty cell to keep grid alignment */}
+              <div />
             </FormRow>
 
             {/* Branch / contact */}
