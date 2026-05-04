@@ -812,17 +812,20 @@ export default async function handler(req, res) {
         companyname2:           cust.companyname2 ? String(cust.companyname2).trim() : '',
         companycategory:        cust.companycategory || '',
         area:                   String(cust.area).trim(),
-        agent:                  cust.agent || '',
+        // agent default '----' = "no agent assigned" placeholder. Empty string fails SQL Account FK lookup.
+        agent:                  cust.agent || '----',
         biznature:              cust.biznature || '',
         creditterm:             String(cust.creditterm).trim(),
         creditlimit:            cust.creditlimit ? String(cust.creditlimit) : '0.00',
         overduelimit:           cust.overduelimit ? String(cust.overduelimit) : '0.00',
-        statementtype:          cust.statementtype || '',
+        // statementtype 'O' = Open Item (standard for SME). Empty fails validation.
+        statementtype:          cust.statementtype || 'O',
         currencycode:           String(cust.currencycode).trim(),
         outstanding:            '0.00',
         allowexceedcreditlimit: cust.allowexceedcreditlimit !== false,
         addpdctocrlimit:        cust.addpdctocrlimit !== false,
-        agingon:                cust.agingon || '',
+        // agingon 'I' = Age on Invoice Date (standard). Empty fails validation.
+        agingon:                cust.agingon || 'I',
         pricetag:               cust.pricetag || '',
         creationdate:           today,
         tax:                    cust.tax || '',
@@ -847,7 +850,8 @@ export default async function handler(req, res) {
         attachments:            '',
         remark:                 cust.remark || '',
         note:                   cust.note || '',
-        status:                 cust.status || '',
+        // status 'A' = Active. Empty string fails SQL Account validation.
+        status:                 cust.status || 'A',
         lastmodified:           0,
         dirty:                  true,
         sdsbranch: [{
