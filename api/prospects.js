@@ -1785,6 +1785,10 @@ export async function handleV2Type(req, res, type) {
       return handleCustomerSearch(req, res);
     case 'recent_customer_codes':
       return handleRecentCustomerCodes(req, res);
+    case 'customer_categories':
+      return handleCustomerCategories(req, res);
+    case 'next_customer_code':
+      return handleNextCustomerCode(req, res);
     default:
       return null; // not a v2 type
   }
@@ -2722,6 +2726,98 @@ async function handleRecentCustomerCodes(req, res) {
     return res.status(200).json({ codes });
   } catch (e) {
     console.error('recent_customer_codes error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Customer Categories — used by Create Customer modal to populate
+// the company-category dropdown. Reads from sql_customers (synced
+// from SQL Account) so the list always reflects what SQL Account's
+// category master actually contains.
+//
+// Why this matters: SQL Account validates companycategory as an FK.
+// Sending a category that doesn't exist in SQL Account's master table
+// causes the cryptic "MainDataSet: Dataset not in edit or insert mode"
+// error during customer creation.
+//
+// Returns: { categories: ["OIL", "SPICES", "SPI/OIL", "RW", ...] }
+async function handleCustomerCategories(req, res) {
+  try {
+    const r = await q(`
+      SELECT companycategory, COUNT(*) AS uses
+      FROM sql_customers
+      WHERE companycategory IS NOT NULL AND companycategory != ''
+      GROUP BY companycategory
+      ORDER BY uses DESC, companycategory ASC
+    `);
+    const categories = r.rows.map(row => row.companycategory);
+    return res.status(200).json({ categories });
+  } catch (e) {
+    console.error('customer_categories error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// Next Customer Code — suggests the next code given a customer name.
+// Pattern: "300-X{NNNN}" where X = first alphabetic letter of name.
+// Examples:
+//   "Tarik Bistro Sdn Bhd"   → 300-T012  (next after existing 300-T011)
+//   "Aeon Stores"            → 300-A0018 (next after existing 300-A0017)
+//   "7-Eleven Holdings"      → 300-X001  (no letter prefix → fallback X)
+//
+// Logic:
+//   - Pick first A-Z character of name
+//   - Find all existing 300-X{digits} codes for that letter
+//   - max(numeric_part) + 1
+//   - Pad to width matching the existing codes (3 or 4 digits)
+//
+// User can still override the suggestion in the form. This is a hint, not a lock.
+//
+// Query: ?type=next_customer_code&name=Some+Customer+Name
+// Returns: { suggested: "300-T012", letter: "T", existing_count: 11 }
+async function handleNextCustomerCode(req, res) {
+  try {
+    const name = String(req.query.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ error: 'name query param required' });
+    }
+
+    // Pick first alphabetic character (uppercase)
+    const firstLetter = name.toUpperCase().match(/[A-Z]/);
+    const letter = firstLetter ? firstLetter[0] : 'X';
+
+    // Find all 300-X{digits} codes for this letter
+    const r = await q(`
+      SELECT code
+      FROM sql_customers
+      WHERE code ~ ('^300-' || $1 || '[0-9]+$')
+      ORDER BY code DESC
+    `, [letter]);
+
+    // Parse trailing digits, find max + max width
+    let maxNum = 0;
+    let maxWidth = 3; // default to 3 digits if no existing codes for this letter
+    for (const row of r.rows) {
+      const m = row.code.match(/^300-[A-Z](\d+)$/);
+      if (m) {
+        const num = parseInt(m[1], 10);
+        if (num > maxNum) maxNum = num;
+        if (m[1].length > maxWidth) maxWidth = m[1].length;
+      }
+    }
+
+    const nextNum = maxNum + 1;
+    const padded = String(nextNum).padStart(maxWidth, '0');
+    const suggested = `300-${letter}${padded}`;
+
+    return res.status(200).json({
+      suggested,
+      letter,
+      existing_count: r.rows.length,
+      next_num: nextNum,
+    });
+  } catch (e) {
+    console.error('next_customer_code error:', e);
     return res.status(500).json({ error: e.message });
   }
 }

@@ -736,14 +736,18 @@ export default async function handler(req, res) {
 
       // Required-field gate. Listed in one place so the frontend can mirror
       // the same validation and avoid round-trips for obvious gaps.
+      // companycategory added 2026-05-04: SQL Account validates this as an FK
+      // against its category master. Sending a value not in the master fires
+      // "MainDataSet: Dataset not in edit or insert mode" with no useful detail.
       const REQUIRED = {
-        code:           'Customer code',
-        companyname:    'Company name',
-        controlaccount: 'Control account',
-        currencycode:   'Currency',
-        creditterm:     'Credit term',
-        area:           'Area',
-        brn:            'BRN (Business Registration Number)',
+        code:            'Customer code',
+        companyname:     'Company name',
+        companycategory: 'Company category',
+        controlaccount:  'Control account',
+        currencycode:    'Currency',
+        creditterm:      'Credit term',
+        area:            'Area',
+        brn:             'BRN (Business Registration Number)',
       };
       const missing = [];
       for (const [k, label] of Object.entries(REQUIRED)) {
