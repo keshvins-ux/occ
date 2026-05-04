@@ -334,6 +334,8 @@ export default async function handler(req, res) {
       'document_tracker',
       'production_overview', 'production_brief', 'production_queue', 'production_gap', 'production_purchase',
       'customer_outlets',
+      'customer_search', 'recent_customer_codes', 'stock_items',
+      'customer_categories', 'next_customer_code',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
