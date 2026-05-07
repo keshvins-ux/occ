@@ -1242,15 +1242,30 @@ export default async function handler(req, res) {
         });
       }
 
-      // Apply OCC defaults for fields SQL Account expects
+      // Apply OCC defaults — verified against SQL Account /supplier POST endpoint
+      // via Step 0 testing on 2026-05-05. Minimum required field set:
+      //   - code, companyname, creditterm (user input or defaulted below)
+      //   - controlaccount '400-0000' (constant for trade suppliers)
+      //   - companycategory '----' (placeholder — suppliers don't use category like customers)
+      //   - area '----', agent '----' (placeholder defaults)
+      //   - statementtype 'O', agingon 'I', status 'A' (constants — empty strings fail)
+      //   - currencycode '----' (constant)
+      //   - idtype 1, submissiontype 0 (must be integers — null fails with
+      //     "Could not convert variant of type (Null) into type (Integer)")
+      // Fields SQL Account auto-populates: creditlimit, overduelimit, sic, irbm_classification.
+      // Note: BRN is OPTIONAL for suppliers (we receive their invoices, don't issue to them).
       const payload = {
-        area: '----',
-        agent: '----',
-        project: '----',
-        terms: '30 Days',
-        currencycode: '----',
-        currencyrate: '1',
-        country: 'MY',
+        controlaccount:  '400-0000',
+        companycategory: '----',
+        area:            '----',
+        agent:            '----',
+        creditterm:       '30 Days',
+        statementtype:    'O',
+        currencycode:     '----',
+        agingon:          'I',
+        status:           'A',
+        idtype:           1,
+        submissiontype:   0,
         ...supplierPayload,  // user-provided fields override defaults
       };
 
