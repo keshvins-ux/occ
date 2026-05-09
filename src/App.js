@@ -20,6 +20,11 @@ import ProductionQueue from "./sections/ProductionQueue";
 import ProductionGap from "./sections/ProductionGap";
 import ProductionPurchase from "./sections/ProductionPurchase";
 import Placeholder from "./sections/Placeholder";
+import CreateSupplierPO from "./sections/CreateSupplierPO";
+import CreateSupplierGRN from "./sections/CreateSupplierGRN";
+import CreateSupplierInvoice from "./sections/CreateSupplierInvoice";
+import CreatePaymentVoucher from "./sections/CreatePaymentVoucher";
+import SupplierDocumentTracker from "./sections/SupplierDocumentTracker";
 
 function AppInner() {
   const { user, loading } = useAuth();
@@ -90,14 +95,14 @@ function renderSection(section, sub) {
     return <Placeholder title="Coming Soon" description="This production feature is under development." icon="factory" />;
   }
   // Procurement (Session 2)
+    // Procurement (Session 2 → Day 7 v1)
   if (section === "procurement") {
-    return (
-      <Placeholder
-        title="Procurement"
-        description="Supplier POs, GRN, stock overview, and supplier directory — all backed by Postgres (sql_purchaseorders, sql_purchaseinvoices, sql_stockitems, sql_suppliers)."
-        icon="cart"
-      />
-    );
+    if (sub === 0) return <CreateSupplierPO />;
+    if (sub === 1) return <CreateSupplierGRN />;
+    if (sub === 2) return <CreateSupplierInvoice />;
+    if (sub === 3) return <CreatePaymentVoucher />;
+    if (sub === 4) return <SupplierDocumentTracker />;
+    return <CreateSupplierPO />; // default — first sub-tab
   }
   // Compliance (Phase 5)
   if (section === "compliance") {
