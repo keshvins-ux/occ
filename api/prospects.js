@@ -328,7 +328,7 @@ export default async function handler(req, res) {
   // ── V2 dispatch ─────────────────────────────────────────────
   // New OCC v2 UI section endpoints. Return immediately if matched.
   if (req.method === 'GET') {
-    const v2Types = new Set([
+   const v2Types = new Set([
       'overview', 'ar_overview', 'customers', 'so_lifecycle',
       'pipeline', 'analytics', 'comparison', 'comparison_detail', 'comparison_brief', 'top_products',
       'document_tracker',
@@ -336,6 +336,9 @@ export default async function handler(req, res) {
       'customer_outlets',
       'customer_search', 'recent_customer_codes', 'stock_items',
       'customer_categories', 'next_customer_code',
+      // Procurement v1 (Day 7)
+      'supplier_search', 'recent_supplier_codes',
+      'supplier_recent_pos', 'item_price_history',
     ]);
     if (v2Types.has(type)) {
       const result = await handleV2Type(req, res, type);
@@ -1791,6 +1794,15 @@ export async function handleV2Type(req, res, type) {
       return handleCustomerCategories(req, res);
     case 'next_customer_code':
       return handleNextCustomerCode(req, res);
+    // Procurement v1 (Day 7)
+    case 'supplier_search':
+      return handleSupplierSearch(req, res);
+    case 'recent_supplier_codes':
+      return handleRecentSupplierCodes(req, res);
+    case 'supplier_recent_pos':
+      return handleSupplierRecentPos(req, res);
+    case 'item_price_history':
+      return handleItemPriceHistory(req, res);
     default:
       return null; // not a v2 type
   }
@@ -2820,6 +2832,163 @@ async function handleNextCustomerCode(req, res) {
     });
   } catch (e) {
     console.error('next_customer_code error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+// ═══════════════════════════════════════════════════════════════
+// ── PROCUREMENT v1 HANDLERS (Day 7, 2026-05-08) ────────────────
+// Read-only endpoints for the Create Supplier PO page.
+// All include WHERE deleted_at IS NULL on sql_suppliers.
+// ═══════════════════════════════════════════════════════════════
+
+async function handleSupplierSearch(req, res) {
+  try {
+    const qStr = String(req.query?.q || '').trim();
+    if (!qStr || qStr.length < 2) {
+      return res.status(200).json({ matches: [], count: 0 });
+    }
+    const r = await q(`
+      SELECT code, companyname, companyname2, area, creditterm
+      FROM sql_suppliers
+      WHERE code IS NOT NULL
+        AND deleted_at IS NULL
+        AND (
+          UPPER(companyname)  LIKE UPPER($1)
+          OR UPPER(companyname2) LIKE UPPER($1)
+          OR UPPER(code)         LIKE UPPER($1)
+        )
+      ORDER BY
+        CASE WHEN UPPER(companyname) = UPPER($2) THEN 0
+             WHEN UPPER(companyname) LIKE UPPER($3) THEN 1
+             ELSE 2 END,
+        companyname
+      LIMIT 10
+    `, [`%${qStr}%`, qStr, `${qStr}%`]);
+    const matches = r.rows.map(row => ({
+      code:       row.code,
+      name:       row.companyname,
+      outlet:     row.companyname2 || null,
+      area:       row.area || null,
+      creditterm: row.creditterm || null,
+    }));
+    return res.status(200).json({ matches, count: matches.length, source: 'postgres' });
+  } catch (e) {
+    console.error('supplier_search error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleRecentSupplierCodes(req, res) {
+  try {
+    const r = await q(`
+      SELECT code
+      FROM sql_suppliers
+      WHERE code IS NOT NULL AND code != ''
+        AND deleted_at IS NULL
+      ORDER BY synced_at DESC NULLS LAST, code DESC
+      LIMIT 5
+    `);
+    const codes = r.rows.map(row => row.code);
+    return res.status(200).json({ codes });
+  } catch (e) {
+    console.error('recent_supplier_codes error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleSupplierRecentPos(req, res) {
+  try {
+    const code = String(req.query?.code || '').trim();
+    if (!code) {
+      return res.status(400).json({ error: 'code query param required' });
+    }
+    const limit = Math.min(parseInt(req.query?.limit || '5', 10), 20);
+    const r = await q(`
+      SELECT
+        h.docno,
+        h.docdate,
+        h.docamt,
+        (SELECT COUNT(*) FROM sql_pi_v2_lines l
+         WHERE l.dockey = h.dockey AND l.deleted_at IS NULL) AS line_count
+      FROM sql_pi_v2_headers h
+      WHERE h.code = $1
+        AND h.deleted_at IS NULL
+      ORDER BY h.docdate DESC, h.dockey DESC
+      LIMIT $2
+    `, [code, limit]);
+    const pos = r.rows.map(row => ({
+      docno:      row.docno,
+      docdate:    row.docdate,
+      amount:     parseFloat(row.docamt) || 0,
+      line_count: parseInt(row.line_count, 10) || 0,
+    }));
+    return res.status(200).json({ pos, count: pos.length, source: 'postgres' });
+  } catch (e) {
+    console.error('supplier_recent_pos error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleItemPriceHistory(req, res) {
+  try {
+    const itemcode = String(req.query?.itemcode || '').trim();
+    if (!itemcode) {
+      return res.status(400).json({ error: 'itemcode query param required' });
+    }
+    const limit = Math.min(parseInt(req.query?.limit || '5', 10), 20);
+    const recent = await q(`
+      SELECT
+        l.qty, l.uom, l.unitprice,
+        h.docno, h.docdate,
+        h.code AS supplier_code,
+        s.companyname AS supplier_name
+      FROM sql_pi_v2_lines l
+      JOIN sql_pi_v2_headers h ON h.dockey = l.dockey
+      LEFT JOIN sql_suppliers s ON s.code = h.code
+      WHERE l.itemcode = $1
+        AND l.deleted_at IS NULL
+        AND h.deleted_at IS NULL
+      ORDER BY h.docdate DESC, h.dockey DESC
+      LIMIT $2
+    `, [itemcode, limit]);
+    const stats = await q(`
+      SELECT
+        COUNT(*) AS purchase_count,
+        MIN(NULLIF(l.unitprice::text, '')::numeric) AS min_price,
+        MAX(NULLIF(l.unitprice::text, '')::numeric) AS max_price,
+        AVG(NULLIF(l.unitprice::text, '')::numeric) AS avg_price,
+        COUNT(DISTINCT h.code) AS supplier_count
+      FROM sql_pi_v2_lines l
+      JOIN sql_pi_v2_headers h ON h.dockey = l.dockey
+      WHERE l.itemcode = $1
+        AND l.deleted_at IS NULL
+        AND h.deleted_at IS NULL
+    `, [itemcode]);
+    const recentRows = recent.rows.map(row => ({
+      qty:           parseFloat(row.qty) || 0,
+      uom:           row.uom || '',
+      unitprice:     parseFloat(row.unitprice) || 0,
+      docno:         row.docno,
+      docdate:       row.docdate,
+      supplier_code: row.supplier_code,
+      supplier_name: row.supplier_name || row.supplier_code,
+    }));
+    const s = stats.rows[0] || {};
+    const summary = {
+      purchase_count: parseInt(s.purchase_count, 10) || 0,
+      supplier_count: parseInt(s.supplier_count, 10) || 0,
+      min_price:      s.min_price !== null ? parseFloat(s.min_price) : null,
+      max_price:      s.max_price !== null ? parseFloat(s.max_price) : null,
+      avg_price:      s.avg_price !== null ? parseFloat(s.avg_price) : null,
+    };
+    return res.status(200).json({
+      itemcode,
+      recent:  recentRows,
+      summary,
+      source:  'postgres',
+    });
+  } catch (e) {
+    console.error('item_price_history error:', e);
     return res.status(500).json({ error: e.message });
   }
 }
